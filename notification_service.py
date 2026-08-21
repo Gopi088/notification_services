@@ -59,9 +59,15 @@ def server_up() -> bool:
 
 
 def kill_port_holder() -> None:
-    """Kill whatever process holds PORT (stuck/suspended servers included)."""
+    """Kill whatever process holds PORT plus any orphaned project servers.
+
+    Orphaned uvicorn reload workers keep respawning and re-binding the port,
+    so we kill every process whose command line mentions this project's
+    uvicorn binary before returning.
+    """
     hex_port = f"{PORT:04X}"
     killed = []
+    project_bin = str(ROOT / "venv" / "bin" / "uvicorn")
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
@@ -75,6 +81,20 @@ def kill_port_holder() -> None:
                             killed.append(pid)
         except (OSError, ValueError, PermissionError):
             continue
+    try:
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                    cmd = fh.read().replace(b"\x00", b" ").decode(errors="replace")
+            except (OSError, PermissionError):
+                continue
+            if "spawn_main" in cmd or (project_bin in cmd and "notification" in cmd):
+                os.kill(int(pid), 9)
+                killed.append(pid)
+    except (OSError, ValueError):
+        pass
     if killed:
         print(f"Killed stuck process(es) on port {PORT}: {', '.join(killed)}")
         time.sleep(2)
@@ -101,8 +121,7 @@ def ensure_server() -> bool:
     cmd = [str(ROOT / "run.sh")]
     if not (ROOT / "run.sh").exists():
         cmd = [str(ROOT / "venv" / "bin" / "uvicorn"), "app.main:app",
-               "--reload", "--reload-dir", "app", "--host", "127.0.0.1",
-               "--port", str(PORT)]
+               "--host", "127.0.0.1", "--port", str(PORT)]
     subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
                      start_new_session=True)
 
