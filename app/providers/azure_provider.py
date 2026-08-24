@@ -9,80 +9,25 @@ One connection string authenticates everything:
 
 Requires AZURE_COMMUNICATION_CONNECTION_STRING plus channel settings in .env.
 """
-import html
+import base64
+import ipaddress
+import logging
 import re
+import socket
+import urllib.parse
 import uuid
+from typing import Any, Dict, Optional
+
+import httpx
 
 from app.config import get_settings
 from app.providers.base import NotificationProvider, ProviderConfigError, ProviderError, ProviderResult
+from app.templates import TemplateError, render_email
+
+logger = logging.getLogger("azure_provider")
 
 _DIGITS_RE = re.compile(r"[^\d]")
-
-
-def _render_html_email(message: str) -> str:
-    """Professional, email-client-friendly HTML body (inline styles only)."""
-    body = html.escape(message)
-    return f"""\
-<!DOCTYPE html>
-<html>
-<body style="margin:0;padding:0;background-color:#eef1f6;font-family:'Segoe UI',Arial,Helvetica,sans-serif;">
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#eef1f6;padding:40px 16px;">
-    <tr>
-      <td align="center">
-        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 4px 16px rgba(17,24,39,0.08);">
-          <tr>
-            <td style="background:linear-gradient(135deg,#2563eb,#7c3aed);padding:28px 36px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
-                <tr>
-                  <td style="width:40px;">
-                    <table role="presentation" cellpadding="0" cellspacing="0" style="background-color:#ffffff;border-radius:50%;width:34px;height:34px;">
-                      <tr><td align="center" style="font-size:16px;font-weight:bold;color:#2563eb;line-height:34px;">N</td></tr>
-                    </table>
-                  </td>
-                  <td>
-                    <span style="color:#ffffff;font-size:17px;font-weight:600;letter-spacing:0.3px;">Notification Service</span>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:36px 36px 8px 36px;">
-              <span style="display:inline-block;background-color:#e0e7ff;color:#3730a3;font-size:11px;font-weight:600;letter-spacing:1.2px;text-transform:uppercase;padding:5px 12px;border-radius:999px;">New Notification</span>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:16px 36px 8px 36px;">
-              <h1 style="margin:0;font-size:22px;color:#111827;font-weight:700;">Hello,</h1>
-              <p style="margin:8px 0 0;font-size:14px;color:#6b7280;line-height:1.6;">You have received a new message.</p>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:20px 36px;">
-              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;">
-                <tr>
-                  <td style="padding:20px 24px;color:#111827;font-size:15px;line-height:1.7;white-space:pre-wrap;word-wrap:break-word;">{body}</td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:12px 36px 32px 36px;color:#9ca3af;font-size:12px;line-height:1.6;">
-              This message was sent to you by the Notification Service.<br/>
-              Please do not reply to this email.
-            </td>
-          </tr>
-          <tr>
-            <td style="padding:18px 36px;border-top:1px solid #eef0f3;background-color:#fafbfc;">
-              <span style="color:#9ca3af;font-size:11px;">Sent via Azure Communication Services</span>
-            </td>
-          </tr>
-        </table>
-      </td>
-    </tr>
-  </table>
-</body>
-</html>"""
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB per downloaded attachment
 
 
 def _normalize_phone(contact: str, country_code: str) -> str:
@@ -103,13 +48,13 @@ class _AzureMixin:
 
     def _connection_string(self) -> str:
         s = self.settings
-        if not s.AZURE_COMMUNICATION_CONNECTION_STRING or "your_" in s.AZURE_COMMUNICATION_CONNECTION_STRING:
+        if not s.connection_string or "your_" in s.connection_string:
             raise ProviderConfigError(
-                "Azure is not configured. Set AZURE_COMMUNICATION_CONNECTION_STRING "
+                "Azure is not configured. Set COMMUNICATION_SERVICES_CONNECTION_STRING "
                 "in .env (Azure portal -> your Communication Services resource -> "
                 "Keys -> Connection string)."
             )
-        return s.AZURE_COMMUNICATION_CONNECTION_STRING
+        return s.connection_string
 
 
 class AzureSMSProvider(_AzureMixin, NotificationProvider):
@@ -145,11 +90,29 @@ class AzureSMSProvider(_AzureMixin, NotificationProvider):
 
         return ProviderResult(self.name, result.message_id, "sent")
 
+    def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
+        recipient = payload.get("recipient", "")
+        message = payload.get("message") or (str(data) if isinstance(data, str) else "") or ""
+        return self.send(recipient, message)
+
 
 class AzureEmailProvider(_AzureMixin, NotificationProvider):
     name = "azure_email"
 
-    def send(self, contact: str, message: str) -> ProviderResult:
+    def send(self, contact: str, message: str, subject: str = "Notification") -> ProviderResult:
+        return self._send_email(contact, message, subject=subject)
+
+    def _send_email(
+        self,
+        contact: str,
+        message: str,
+        subject: str = "Notification",
+        html: Optional[str] = None,
+        cc: Optional[list] = None,
+        bcc: Optional[list] = None,
+        reply_to: Optional[str] = None,
+        attachments: Optional[list] = None,
+    ) -> ProviderResult:
         if self.settings.MOCK_MODE:
             return ProviderResult(self.name, f"mock-{uuid.uuid4().hex[:12]}", "sent")
 
@@ -163,15 +126,25 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
                 "e.g. DoNotReply@yourdomain.com)."
             )
 
+        recipients = {"to": [{"address": contact}]}
+        if cc:
+            recipients["cc"] = [{"address": addr} for addr in cc]
+        if bcc:
+            recipients["bcc"] = [{"address": addr} for addr in bcc]
+
         email_message = {
             "senderAddress": s.AZURE_EMAIL_FROM,
-            "recipients": {"to": [{"address": contact}]},
+            "recipients": recipients,
             "content": {
-                "subject": "Notification",
+                "subject": subject,
                 "plainText": message,
-                "html": _render_html_email(message),
+                "html": html or render_email(body=message, subject=subject),
             },
         }
+        if reply_to:
+            email_message["replyTo"] = [{"address": reply_to}]
+        if attachments:
+            email_message["attachments"] = self._build_attachments(attachments)
 
         try:
             email_client = EmailClient.from_connection_string(self._connection_string())
@@ -183,39 +156,328 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
         message_id = result.get("message_id", "") if isinstance(result, dict) else str(result)
         return ProviderResult(self.name, message_id, "sent")
 
+    @staticmethod
+    def _build_attachments(attachments: list) -> list:
+        built = []
+        for att in attachments:
+            name = att.get("name") or "attachment"
+            content_type = att.get("type") or att.get("contentType") or "application/octet-stream"
+            if att.get("content_base64"):
+                encoded = att["content_base64"]
+            elif att.get("url"):
+                encoded = AzureEmailProvider._fetch_as_base64(att["url"])
+            else:
+                raise ProviderError(f"Attachment '{name}' needs a 'url' or 'content_base64'.")
+            built.append({"name": name, "contentType": content_type, "contentInBase64": encoded})
+        return built
+
+    @staticmethod
+    def _validate_url(url: str) -> None:
+        """Reject non-HTTPS URLs, embedded credentials, redirects to other
+        hosts, and any resolution to private/loopback/link-local/reserved IPs
+        (mitigates SSRF via user-supplied attachment URLs)."""
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "https":
+            raise ProviderError(
+                f"Attachment url must use https, got '{parsed.scheme or 'none'}'."
+            )
+        host = parsed.hostname
+        if not host:
+            raise ProviderError(f"Attachment url has no host: {url}")
+        if parsed.username or parsed.password:
+            raise ProviderError("Attachment url must not contain credentials.")
+        if host.lower() == "localhost":
+            raise ProviderError("Attachment url must not point at localhost.")
+        try:
+            addr = ipaddress.ip_address(host)
+            ips = [addr]
+        except ValueError:
+            try:
+                ips = [ipaddress.ip_address(info[4][0]) for info in socket.getaddrinfo(host, parsed.port or 443)]
+            except (socket.gaierror, ValueError) as exc:
+                raise ProviderError(f"Could not resolve attachment host '{host}'.") from exc
+        for ip in ips:
+            if (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                raise ProviderError(f"Attachment url resolves to a blocked address: {ip}.")
+
+    @staticmethod
+    def _fetch_as_base64(url: str) -> str:
+        AzureEmailProvider._validate_url(url)
+        reason: Optional[str] = None
+        chunks: list = []
+        try:
+            with httpx.stream("GET", url, timeout=30, follow_redirects=False) as resp:
+                if resp.is_redirect or resp.status_code in (301, 302, 303, 307, 308):
+                    reason = f"Attachment url redirects are not allowed: {url}"
+                else:
+                    resp.raise_for_status()
+                    content_length = resp.headers.get("content-length")
+                    if content_length:
+                        try:
+                            if int(content_length) > MAX_ATTACHMENT_BYTES:
+                                reason = f"Attachment from {url} exceeds {MAX_ATTACHMENT_BYTES} bytes."
+                        except ValueError:
+                            pass
+                    if reason is None:
+                        total = 0
+                        for chunk in resp.iter_bytes(64 * 1024):
+                            total += len(chunk)
+                            if total > MAX_ATTACHMENT_BYTES:
+                                reason = f"Attachment from {url} exceeds {MAX_ATTACHMENT_BYTES} bytes."
+                                break
+                            chunks.append(chunk)
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"Could not download attachment from {url}: {exc}") from exc
+        if reason is not None:
+            raise ProviderError(reason)
+        return base64.b64encode(b"".join(chunks)).decode("ascii")
+
+    def send_with_template(
+        self,
+        contact: str,
+        message: str,
+        template_name: str,
+        template_language: Optional[str] = None,
+        template_params: Optional[Dict[str, str]] = None,
+    ) -> ProviderResult:
+        """
+        Send via a local HTML email template from templates/email/<name>.html.
+        `template_params` may override the subject via a 'subject' key.
+        """
+        params = template_params or {}
+        subject = params.get("subject", "Notification")
+        try:
+            html_body = render_email(body=message, subject=subject, template_name=template_name)
+        except TemplateError as exc:
+            raise ProviderError(str(exc)) from exc
+        return self._send_email(contact, message, subject=subject, html=html_body)
+
+    def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
+        recipient = payload.get("recipient", "")
+        message = payload.get("message") or (str(data) if isinstance(data, str) else "") or ""
+        subject = payload.get("subject") or "Notification"
+        html = payload.get("html")
+        cc = payload.get("cc") or []
+        bcc = payload.get("bcc") or []
+        reply_to = payload.get("replyTo") or payload.get("reply_to")
+        attachments = payload.get("attachments") or []
+        return self._send_email(
+            recipient,
+            message,
+            subject=subject,
+            html=html,
+            cc=cc,
+            bcc=bcc,
+            reply_to=reply_to,
+            attachments=attachments,
+        )
+
 
 class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
     name = "azure_whatsapp"
+
+    def _log(self, *parts: Any) -> None:
+        logger.info("[WhatsApp] %s", " ".join(str(p) for p in parts))
 
     def send(self, contact: str, message: str) -> ProviderResult:
         if self.settings.MOCK_MODE:
             return ProviderResult(self.name, f"mock-{uuid.uuid4().hex[:12]}", "sent")
 
-        from azure.communication.messages import NotificationMessagesClient
-        from azure.communication.messages.models import TextNotificationContent
-
         s = self.settings
-        if not s.AZURE_WHATSAPP_CHANNEL_ID:
+        to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
+        self._log("Provider: Azure Communication Services")
+        self._log("From:", s.whatsapp_from or "channel-linked business number")
+        self._log("To:", to)
+        self._log("Channel ID:", s.whatsapp_channel_id)
+        self._log("Mode:", "REAL" if not s.MOCK_MODE else "MOCK")
+        self._log("Message type: TEXT (24h session window)")
+
+        if not s.whatsapp_channel_id:
             raise ProviderConfigError(
-                "WhatsApp provider is not configured. Set AZURE_WHATSAPP_CHANNEL_ID "
+                "WhatsApp provider is not configured. Set WHATSAPP_CHANNEL_ID "
                 "in .env (WhatsApp channel registration ID from the Azure portal)."
             )
 
+        # Free-form text is ONLY delivered inside a 24h session window (the
+        # recipient messaged the business number first). It is sent as-is; it
+        # is never swapped for a template, so the caller's message reaches the
+        # recipient when a session is open.
+        from azure.communication.messages import NotificationMessagesClient
+        from azure.communication.messages.models import TextNotificationContent
+
+        self._log("Sending text message...")
         try:
             client = NotificationMessagesClient.from_connection_string(self._connection_string())
             content = TextNotificationContent(
-                channel_registration_id=s.AZURE_WHATSAPP_CHANNEL_ID,
-                to=[_normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)],
+                channel_registration_id=s.whatsapp_channel_id,
+                to=[to],
                 content=message,
             )
             response = client.send(content)
         except Exception as exc:  # noqa: BLE001
+            logger.error("[WhatsApp] Azure rejected text message: %s", exc)
             raise ProviderError(f"Azure WhatsApp error: {exc}") from exc
 
         if not response.receipts:
             raise ProviderError("Azure WhatsApp returned no delivery receipt.")
         receipt = response.receipts[0]
         if getattr(receipt, "error", None):
+            logger.error("[WhatsApp] Azure returned an error for %s: %s", receipt.to, receipt.error)
             raise ProviderError(f"Azure WhatsApp failed for {receipt.to}: {receipt.error}")
 
+        self._log("Azure message ID:", receipt.message_id)
+        self._log("Provider accepted message")
         return ProviderResult(self.name, receipt.message_id, "sent")
+
+    def send_template(
+        self,
+        contact: str,
+        template_name: str,
+        language: Optional[str] = None,
+        template_params: Optional[Dict[str, str]] = None,
+    ) -> ProviderResult:
+        """
+        Send an approved Meta/WhatsApp template to a contact via Azure
+        Communication Services Advanced Messaging. This is the ONLY way to
+        reach a number that has never messaged the business (no 24h session
+        required).
+
+        `template_params` maps template variable names to values, e.g.
+        {"name": "Rahul"}. A template with no variables (static body) is sent
+        as-is when no params are given.
+
+        The returned status is "sent" (Azure accepted the message). Actual
+        delivery (delivered/failed/read) arrives via the Azure delivery-status
+        webhook and must not be claimed here.
+        """
+        if self.settings.MOCK_MODE:
+            return ProviderResult(self.name, f"mock-{uuid.uuid4().hex[:12]}", "sent")
+
+        s = self.settings
+        to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
+
+        if not s.connection_string or "your_" in s.connection_string:
+            raise ProviderConfigError(
+                "Azure is not configured. Set COMMUNICATION_SERVICES_CONNECTION_STRING "
+                "in .env (Azure portal -> Communication Services -> Keys -> Connection string)."
+            )
+        if not s.whatsapp_channel_id:
+            raise ProviderConfigError(
+                "WhatsApp provider is not configured. Set WHATSAPP_CHANNEL_ID "
+                "in .env (WhatsApp channel registration ID from the Azure portal)."
+            )
+        if not template_name:
+            raise ProviderConfigError(
+                "No WhatsApp template name given. Provide template_name or set "
+                "WHATSAPP_TEMPLATE_NAME in .env."
+            )
+
+        lang = language or s.whatsapp_template_language
+        params = template_params or {}
+
+        self._log("Provider: Azure Communication Services")
+        self._log("From:", s.whatsapp_from or "channel-linked business number")
+        self._log("To:", to)
+        self._log("Channel ID:", s.whatsapp_channel_id)
+        self._log("Mode:", "REAL" if not s.MOCK_MODE else "MOCK")
+        self._log("Message type: TEMPLATE")
+        self._log("Template:", template_name)
+        self._log("Language:", lang)
+
+        from azure.communication.messages import NotificationMessagesClient
+        from azure.communication.messages.models import (
+            MessageTemplate,
+            MessageTemplateText,
+            TemplateNotificationContent,
+            WhatsAppMessageTemplateBindings,
+            WhatsAppMessageTemplateBindingsComponent,
+        )
+
+        # Build one binding + value per supplied parameter so templates with
+        # variables ({{1}}, {{2}}, ...) are filled in order. Without params,
+        # send the template as-is (static templates have no variables).
+        if params:
+            body_bindings = [
+                WhatsAppMessageTemplateBindingsComponent(ref_value=name) for name in params
+            ]
+            template_values = [
+                MessageTemplateText(name=name, text=str(value)) for name, value in params.items()
+            ]
+            bindings = WhatsAppMessageTemplateBindings(body=body_bindings)
+        else:
+            bindings = WhatsAppMessageTemplateBindings(body=[])
+            template_values = []
+
+        template = MessageTemplate(
+            name=template_name,
+            language=lang,
+            bindings=bindings,
+            template_values=template_values,
+        )
+        content = TemplateNotificationContent(
+            channel_registration_id=s.whatsapp_channel_id,
+            to=[to],
+            template=template,
+        )
+
+        self._log("Sending template message...")
+        try:
+            client = NotificationMessagesClient.from_connection_string(self._connection_string())
+            response = client.send(content)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[WhatsApp] Azure rejected template %s: %s", template_name, exc)
+            raise ProviderError(f"Azure WhatsApp template error: {exc}") from exc
+
+        if not response.receipts:
+            raise ProviderError("Azure WhatsApp template returned no delivery receipt.")
+        receipt = response.receipts[0]
+        if getattr(receipt, "error", None):
+            logger.error("[WhatsApp] Azure returned an error for %s: %s", receipt.to, receipt.error)
+            raise ProviderError(f"Azure WhatsApp template failed for {receipt.to}: {receipt.error}")
+
+        self._log("Azure message ID:", receipt.message_id)
+        self._log("Provider accepted message")
+        return ProviderResult(self.name, receipt.message_id, "sent")
+
+    def send_with_template(
+        self,
+        contact: str,
+        message: str,
+        template_name: str,
+        template_language: Optional[str] = None,
+        template_params: Optional[Dict[str, str]] = None,
+    ) -> ProviderResult:
+        """
+        Backward-compatible alias of `send_template`. The `message` argument is
+        ignored for WhatsApp template sends - templates render their own body.
+        """
+        return self.send_template(
+            contact,
+            template_name=template_name,
+            language=template_language,
+            template_params=template_params,
+        )
+
+    def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
+        recipient = payload.get("recipient", "")
+        message = payload.get("message") or (str(data) if isinstance(data, str) else "") or ""
+        template = payload.get("template") or {}
+        if template.get("id"):
+            params = {p["name"]: p["value"] for p in (template.get("params") or [])}
+            if not params and isinstance(data, dict):
+                params = {str(k): str(v) for k, v in data.items()}
+            return self.send_with_template(
+                recipient,
+                message,
+                template_name=template["id"],
+                template_language=template.get("language"),
+                template_params=params,
+            )
+        return self.send(recipient, message)

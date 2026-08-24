@@ -1,63 +1,88 @@
+"""
+Legacy router (v0) kept for backward compatibility.
+
+New callers should use /api/v1. These unversioned routes still work but map
+onto the same orchestrator so behavior stays consistent.
+"""
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from pydantic import BaseModel, Field, field_validator
 
-from app.database import create_message, get_message
-from app.schemas import ErrorResponse, SendRequest, SendResponse, StatusResponse
-from app.services.notification_service import process_message
+from app.auth import require_api_key
+from app.database import get_message
+from app.orchestrator import get_message_summary, orchestrate_send
+from app.schemas import Channel, SendRequest as V1SendRequest, ChannelRequest
 from app.validation import ContactValidationError, validate_contact
 
 router = APIRouter()
 
 
+class LegacySendRequest(BaseModel):
+    channel: Channel
+    contact: str = Field(..., min_length=3, max_length=254)
+    message: str = Field(..., min_length=1, max_length=4096)
+
+    @field_validator("contact")
+    @classmethod
+    def strip_contact(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("message")
+    @classmethod
+    def strip_message(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("message cannot be empty")
+        return v
+
+
+class LegacyError(BaseModel):
+    detail: str
+
+
 @router.post(
     "/send",
-    response_model=SendResponse,
-    responses={400: {"model": ErrorResponse}},
     status_code=202,
-    summary="Queue a message for delivery over WhatsApp, SMS, or Email",
+    summary="Queue a message for delivery (legacy single-channel API)",
+    responses={400: {"model": LegacyError}},
+    dependencies=[Depends(require_api_key)],
 )
-def send_message(payload: SendRequest, background_tasks: BackgroundTasks) -> SendResponse:
+def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks) -> dict:
     try:
         validate_contact(payload.channel, payload.contact)
     except ContactValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    message_id = str(uuid.uuid4())
-    create_message(
-        message_id=message_id,
-        channel=payload.channel.value,
-        contact=payload.contact,
-        message=payload.message,
-        status="queued",
+    summary = orchestrate_send(
+        V1SendRequest(
+            channels=[ChannelRequest(channel=payload.channel, contact=payload.contact)],
+            message=payload.message,
+        ),
+        background_tasks,
     )
-
-    # Sending happens after the response is returned so /send responds
-    # immediately; poll GET /status/{message_id} for the outcome.
-    background_tasks.add_task(process_message, message_id, payload.channel, payload.contact, payload.message)
-
-    return SendResponse(message_id=message_id, status="queued")
+    first = summary["channels"][0]
+    return {"message_id": first["message_id"], "status": "queued"}
 
 
 @router.get(
     "/status/{message_id}",
-    response_model=StatusResponse,
-    responses={404: {"model": ErrorResponse}},
-    summary="Get the current delivery status of a previously sent message",
+    summary="Get delivery status (legacy API)",
+    responses={404: {"model": LegacyError}},
+    dependencies=[Depends(require_api_key)],
 )
-def get_status(message_id: str) -> StatusResponse:
+def get_status(message_id: str) -> dict:
     row = get_message(message_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No message found with id '{message_id}'")
-
-    return StatusResponse(
-        message_id=row["message_id"],
-        channel=row["channel"],
-        contact=row["contact"],
-        status=row["status"],
-        provider=row["provider"],
-        provider_message_id=row["provider_message_id"],
-        error=row["error"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-    )
+    return {
+        "message_id": row["message_id"],
+        "channel": row["channel"],
+        "contact": row["contact"],
+        "status": row["status"],
+        "provider": row["provider"],
+        "provider_message_id": row["provider_message_id"],
+        "error": row["error"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }

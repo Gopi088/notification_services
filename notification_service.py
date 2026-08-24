@@ -6,10 +6,15 @@ Notification Service CLI - run it like any Linux command.
   python3 notification_service.py send whatsapp 9887270348 "Hello"
   python3 notification_service.py send sms     9887270348 "Your OTP is 482913"
   python3 notification_service.py send email   you@example.com "Order shipped"
+  python3 notification_service.py send email,whatsapp +919887270348 "Order shipped"
+  python3 notification_service.py send email you@example.com "Order shipped" --template default
+  python3 notification_service.py send-template <number> <template_name> [--param name=value ...]
+  python3 notification_service.py send-event event.json
   python3 notification_service.py status <message_id>
   python3 notification_service.py -v status <message_id>
 
 The server is started automatically if it isn't running.
+Set NOTIFICATION_API_KEY=<key> when AUTH_ENABLED=true in .env.
 """
 import json
 import os
@@ -26,6 +31,7 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 PORT = 8000
 LOG_FILE = "/tmp/notification-service.log"
 VERBOSE = False
+API_KEY = os.environ.get("NOTIFICATION_API_KEY", "")
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
@@ -34,10 +40,13 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 def http(method: str, path: str, payload: dict | None = None):
     data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
     req = urllib.request.Request(
         BASE_URL + path,
         data=data,
-        headers={"Content-Type": "application/json"} if data else {},
+        headers=headers,
         method=method,
     )
     try:
@@ -157,9 +166,9 @@ def config_check() -> None:
         print()
         return
 
-    conn = env.get("AZURE_COMMUNICATION_CONNECTION_STRING", "")
+    conn = env.get("COMMUNICATION_SERVICES_CONNECTION_STRING") or env.get("AZURE_COMMUNICATION_CONNECTION_STRING", "")
     if not conn or "your_" in conn:
-        print("! MOCK_MODE=false but AZURE_COMMUNICATION_CONNECTION_STRING is")
+        print("! MOCK_MODE=false but COMMUNICATION_SERVICES_CONNECTION_STRING is")
         print("  missing/placeholder in .env. Real sends will fail until you add it")
         print("  (Azure portal -> Communication Services -> Keys -> Connection string).")
         print()
@@ -168,8 +177,8 @@ def config_check() -> None:
         print("  (sms) AZURE_SMS_FROM is empty - SMS sends will fail")
     if not env.get("AZURE_EMAIL_FROM"):
         print("  (email) AZURE_EMAIL_FROM is empty - Email sends will fail")
-    if not env.get("AZURE_WHATSAPP_CHANNEL_ID"):
-        print("  (whatsapp) AZURE_WHATSAPP_CHANNEL_ID is empty - WhatsApp sends will fail")
+    if not (env.get("WHATSAPP_CHANNEL_ID") or env.get("AZURE_WHATSAPP_CHANNEL_ID")):
+        print("  (whatsapp) WHATSAPP_CHANNEL_ID is empty - WhatsApp sends will fail")
     print()
     print("  Note: WhatsApp outbound to a new contact needs an approved Meta")
     print("  template; free text only works inside a 24h session window.")
@@ -178,38 +187,129 @@ def config_check() -> None:
 
 # ---------------------------------------------------------------- actions
 
-def do_send(channel: str, contact: str, message: str) -> None:
-    code, body = http("POST", "/send", {
-        "channel": channel, "contact": contact, "message": message})
+def do_send_entries(entries: list, message: str) -> None:
+    """POST pre-built channel entries (each with its own channel/contact/template)."""
+    payload = {"channels": entries, "message": message}
+    code, body = http("POST", "/api/v1/notifications/send", payload)
     if code != 202 or not body.get("message_id"):
-        detail = body.get("detail", body)
+        detail = body.get("error", body.get("detail", body))
+        if isinstance(detail, dict):
+            detail = detail.get("message", detail)
         print(f"Error: {detail}")
         sys.exit(1)
-    mid = body["message_id"]
-    print(f"Queued for {channel} -> {contact}")
-    print(f"Message id  : {mid}")
-    print(f"Check status: python3 notification_service.py status {mid}")
+    group_id = body["message_id"]
+    templates = {e["channel"]: e.get("template_name", "") for e in entries}
+    print(f"Queued {len(entries)} channel(s):")
+    for c in body.get("channels", []):
+        tpl = f", template={templates.get(c['channel'])}" if templates.get(c["channel"]) else ""
+        print(f"  - {c['channel']} -> {c['contact']}  (message id: {c['message_id']}{tpl})")
+    print(f"Group id    : {group_id}")
+    print(f"Check status: python3 notification_service.py status {group_id}")
+    if VERBOSE:
+        print(json.dumps(body, indent=2))
+
+
+def do_send(channels: list, message: str, template: str = "", template_params: dict | None = None) -> None:
+    entries = []
+    for ch, ct in channels:
+        entry = {"channel": ch, "contact": ct}
+        if template:
+            entry["template_name"] = template
+        if template_params:
+            entry["template_params"] = [
+                {"name": k, "value": v} for k, v in template_params.items()
+            ]
+        entries.append(entry)
+    do_send_entries(entries, message)
+
+
+def do_send_template(number: str, template_name: str, template_params: dict | None = None) -> None:
+    """Send an approved WhatsApp template to a number (no 24h session needed)."""
+    payload = {
+        "channels": [
+            {
+                "channel": "whatsapp",
+                "contact": number,
+                "template_name": template_name,
+                "template_language": os.environ.get("WHATSAPP_TEMPLATE_LANGUAGE", "en"),
+            }
+        ],
+        "message": f"[template:{template_name}]",
+    }
+    if template_params:
+        payload["channels"][0]["template_params"] = [
+            {"name": k, "value": v} for k, v in template_params.items()
+        ]
+    code, body = http("POST", "/api/v1/notifications/send", payload)
+    if code != 202 or not body.get("message_id"):
+        detail = body.get("error", body.get("detail", body))
+        if isinstance(detail, dict):
+            detail = detail.get("message", detail)
+        print(f"Error: {detail}")
+        sys.exit(1)
+    group_id = body["message_id"]
+    for c in body.get("channels", []):
+        print(f"  - {c['channel']} -> {c['contact']}  (message id: {c['message_id']}, template={template_name})")
+    print(f"Group id    : {group_id}")
+    print(f"Check status: python3 notification_service.py status {group_id}")
+    if VERBOSE:
+        print(json.dumps(body, indent=2))
+
+
+def do_send_event(event_file: str) -> None:
+    path = Path(event_file)
+    if not path.is_file():
+        print(f"Error: file not found: {event_file}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"Error: could not read {event_file}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    code, body = http("POST", "/api/v1/notifications/event", payload)
+    if code != 202 or not body.get("message_id"):
+        detail = body.get("error", body.get("detail", body))
+        if isinstance(detail, dict):
+            detail = detail.get("message", detail)
+        print(f"Error: {detail}")
+        sys.exit(1)
+    group_id = body["message_id"]
+    print(f"Queued {len(body.get('channels', []))} delivery(ies):")
+    for c in body.get("channels", []):
+        print(f"  - {c['channel']} -> {c['contact']}  (message id: {c['message_id']})")
+    print(f"Group id    : {group_id}")
+    print(f"Check status: python3 notification_service.py status {group_id}")
     if VERBOSE:
         print(json.dumps(body, indent=2))
 
 
 def do_status(message_id: str) -> None:
-    code, body = http("GET", f"/status/{message_id}")
+    code, body = http("GET", f"/api/v1/notifications/{message_id}/status")
     if code == 404:
         print(f"Message {message_id} not found.")
         sys.exit(1)
     if code != 200:
-        print(f"Error: {body.get('detail', body)}")
+        detail = body.get("error", body.get("detail", body))
+        if isinstance(detail, dict):
+            detail = detail.get("message", detail)
+        print(f"Error: {detail}")
         sys.exit(1)
-    status = body.get("status", "")
     marks = {"delivered": "DELIVERED", "failed": "FAILED",
-             "sent": "SENT", "queued": "QUEUED"}
-    print(f"Status: {marks.get(status, status)}")
-    print(f"channel      : {body.get('channel')}")
-    print(f"contact      : {body.get('contact')}")
-    print(f"provider     : {body.get('provider')}")
-    print(f"error        : {body.get('error')}")
-    print(f"updated at   : {body.get('updated_at')}")
+             "sent": "SENT", "queued": "QUEUED", "partial": "PARTIAL"}
+    print(f"Status: {marks.get(body.get('status', ''), body.get('status', ''))}")
+    if body.get("reference"):
+        print(f"reference    : {body['reference']}")
+    for c in body.get("channels", []):
+        mark = marks.get(c.get("status", ""), c.get("status", ""))
+        print(f"  [{c.get('channel')}] {mark}")
+        print(f"    contact      : {c.get('contact')}")
+        print(f"    provider     : {c.get('provider')}")
+        print(f"    error        : {c.get('error')}")
+        print(f"    elapsed      : {c.get('elapsed_seconds')}s (timeout {c.get('delivery_timeout_seconds')}s)")
+        if c.get("timed_out"):
+            print("    TIMED OUT    : still waiting, no delivery receipt within SLA - check the provider/webhook")
+        print(f"    updated at   : {c.get('updated_at')}")
     if VERBOSE:
         print(json.dumps(body, indent=2))
 
@@ -222,10 +322,36 @@ def interactive() -> None:
     while True:
         choice = input("What do you want to do? (1=send 2=check status 3=quit): ").strip()
         if choice == "1":
-            channel = input("Channel (whatsapp/sms/email): ").strip()
+            print("Channels: whatsapp, sms, email (comma-separated to send to several)")
+            raw = input("Channel(s): ").strip()
+            channels = [c.strip() for c in raw.split(",") if c.strip()]
             contact = input("Contact (phone or email): ").strip()
             message = input("Message: ").strip()
-            do_send(channel, contact, message)
+            entries = []
+            for ch in channels:
+                entry = {"channel": ch, "contact": contact}
+                if ch == "whatsapp":
+                    print("WhatsApp template: blank = none (free text, 24h window only) | or an approved Meta template name")
+                    tpl = input("WhatsApp template name (blank = none): ").strip()
+                    if tpl:
+                        entry["template_name"] = tpl
+                        raw_params = input(
+                            "Template params (comma-separated name=value, blank = none): "
+                        ).strip()
+                        if raw_params:
+                            entry["template_params"] = []
+                            for pair in raw_params.split(","):
+                                if "=" in pair:
+                                    k, v = pair.split("=", 1)
+                                    entry["template_params"].append({"name": k.strip(), "value": v.strip()})
+                elif ch == "email":
+                    print("Email templates: default | Add your own under templates/email/<name>.html")
+                    tpl = input("Email template name (blank = default): ").strip()
+                    if tpl:
+                        entry["template_name"] = tpl
+                # sms: no template support
+                entries.append(entry)
+            do_send_entries(entries, message)
             print()
         elif choice == "2":
             mid = input("Message id: ").strip()
@@ -264,10 +390,50 @@ def main() -> None:
     cmd, *rest = args
     if cmd == "send" and len(rest) >= 3:
         ensure_server()
-        do_send(rest[0], rest[1], rest[2])
+        template = ""
+        params: dict | None = None
+        filtered = list(rest)
+        if "--template" in filtered:
+            i = filtered.index("--template")
+            if i + 1 < len(filtered):
+                template = filtered[i + 1]
+                del filtered[i:i + 2]
+        if "--param" in filtered:
+            params = {}
+            i = filtered.index("--param")
+            while i < len(filtered) and filtered[i] == "--param":
+                if i + 1 < len(filtered) and "=" in filtered[i + 1]:
+                    k, v = filtered[i + 1].split("=", 1)
+                    params[k.strip()] = v.strip()
+                    del filtered[i:i + 2]
+                else:
+                    break
+        channels = [c.strip() for c in filtered[0].split(",") if c.strip()]
+        do_send([(c, filtered[1]) for c in channels], filtered[2], template=template, template_params=params)
+    elif cmd in ("send-template", "send_template", "sendwhatsapptemplate") and len(rest) >= 2:
+        ensure_server()
+        number = rest[0]
+        template_name = rest[1]
+        # optional --param name=value (repeatable)
+        params: dict | None = None
+        tail = list(rest[2:])
+        if "--param" in tail:
+            params = {}
+            i = tail.index("--param")
+            while i < len(tail) and tail[i] == "--param":
+                if i + 1 < len(tail) and "=" in tail[i + 1]:
+                    k, v = tail[i + 1].split("=", 1)
+                    params[k.strip()] = v.strip()
+                    del tail[i:i + 2]
+                else:
+                    break
+        do_send_template(number, template_name, template_params=params)
     elif cmd == "status" and rest:
         ensure_server()
         do_status(rest[0])
+    elif cmd in ("send-event", "send_event") and rest:
+        ensure_server()
+        do_send_event(rest[0])
     else:
         usage()
         sys.exit(1)
