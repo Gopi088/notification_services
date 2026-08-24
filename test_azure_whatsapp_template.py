@@ -1,21 +1,37 @@
 """
 Direct Azure WhatsApp TEMPLATE test - bypasses the app entirely.
 
-Sends the approved template `test_template` (language `en`) to a NEW number
-that has never messaged the business - templates work without a 24h session.
+Sends the approved template `test_template` (language `en`) to any number.
+Templates work WITHOUT a 24h session, so they can reach new numbers.
 
-Run from the project root:
-    python3 test_azure_whatsapp_template.py
+Run from the project root (10-digit Indian number, or E.164):
+    python3 test_azure_whatsapp_template.py                    # default +919887270348
+    python3 test_azure_whatsapp_template.py 9887270348
+    python3 test_azure_whatsapp_template.py +15551234567
 
-The recipient in .env can be overridden:
-    TEST_WHATSAPP_TO=+916362490250 python3 test_azure_whatsapp_template.py
+The recipient can also be set via TEST_WHATSAPP_TO in the environment.
 
 Never prints the connection string or access key.
 """
 import os
 import sys
 
-RECIPIENT = os.environ.get("TEST_WHATSAPP_TO", "+919887270348")
+RECIPIENT = os.environ.get(
+    "TEST_WHATSAPP_TO",
+    sys.argv[1] if len(sys.argv) > 1 else "+919887270348",
+)
+# Normalize to E.164 (e.g. 9887270348 -> +919887270348, 6362490250 -> +916362490250)
+_raw = RECIPIENT
+_digits = "".join(c for c in _raw if c.isdigit())
+if _digits.startswith("91") and len(_digits) == 12:
+    RECIPIENT = f"+{_digits}"
+elif len(_digits) == 10:
+    RECIPIENT = f"+91{_digits}"
+elif _digits.startswith("+"):
+    RECIPIENT = f"+{_digits.lstrip('+')}"
+else:
+    RECIPIENT = f"+{_digits}"
+
 TEMPLATE_NAME = "test_template"
 TEMPLATE_LANGUAGE = "en"
 # If the template has variables, provide them here, e.g.

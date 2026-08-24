@@ -6,3 +6,5 @@ httpx==0.27.2
 azure-communication-sms==1.1.0
 azure-communication-email==1.1.0
 azure-communication-messages==1.1.0
+vonage==4.8.2
+vonage-messages==1.7.1

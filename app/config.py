@@ -31,6 +31,22 @@ class Settings(BaseSettings):
     # the webhook; this threshold tells callers when to stop waiting.
     DELIVERY_TIMEOUT_SECONDS: int = 300
 
+    # --- Vonage SMS (alternative SMS provider to Azure) ---
+    # If VONAGE_API_KEY and VONAGE_API_SECRET are set, the SMS channel uses
+    # Vonage instead of Azure. Credentials from the Vonage dashboard.
+    VONAGE_API_KEY: str = ""
+    VONAGE_API_SECRET: str = ""
+    # SMS sender ID (phone number in E.164 or an approved alphanumeric sender
+    # ID like "Vonage APIs"). Must be a number you own / a sender registered
+    # with Vonage.
+    VONAGE_SMS_FROM: str = ""
+
+    # --- Vonage WhatsApp Sandbox ---
+    # When VONAGE_WHATSAPP_FROM is set, the WhatsApp channel uses the Vonage
+    # Messages Sandbox instead of Azure. Credentials are shared with Vonage SMS.
+    VONAGE_WHATSAPP_FROM: str = ""
+    VONAGE_WHATSAPP_SANDBOX_URL: str = "https://messages-sandbox.nexmo.com/v1/messages"
+
     # --- Email templates ---
     # Directory holding channel templates. Email templates are HTML files that
     # can contain {{subject}} and {{body}} placeholders.
