@@ -10,9 +10,9 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 from app.auth import require_api_key
-from app.database import get_message
 from app.orchestrator import get_message_summary, orchestrate_send
 from app.schemas import Channel, SendRequest as V1SendRequest, ChannelRequest
+from app.storage import get_storage
 from app.validation import ContactValidationError, validate_contact
 
 router = APIRouter()
@@ -72,7 +72,7 @@ def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks) 
     dependencies=[Depends(require_api_key)],
 )
 def get_status(message_id: str) -> dict:
-    row = get_message(message_id)
+    row = get_message_summary(message_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"No message found with id '{message_id}'")
     return {
@@ -80,9 +80,9 @@ def get_status(message_id: str) -> dict:
         "channel": row["channel"],
         "contact": row["contact"],
         "status": row["status"],
-        "provider": row["provider"],
-        "provider_message_id": row["provider_message_id"],
-        "error": row["error"],
+        "provider": row.get("provider"),
+        "provider_message_id": row.get("provider_message_id"),
+        "error": row.get("error"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }

@@ -12,6 +12,8 @@ Notification Service CLI - run it like any Linux command.
   python3 notification_service.py send-event event.json
   python3 notification_service.py status <message_id>
   python3 notification_service.py -v status <message_id>
+  python3 notification_service.py audit [--limit N] [--user <id>]
+  python3 notification_service.py logs [-f]
 
 The server is started automatically if it isn't running.
 Set NOTIFICATION_API_KEY=<key> when AUTH_ENABLED=true in .env.
@@ -30,6 +32,20 @@ ROOT = Path(__file__).resolve().parent
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 PORT = 8000
 LOG_FILE = "/tmp/notification-service.log"
+
+
+def _log_paths() -> tuple:
+    """Read the configured app-log and audit-log paths from .env (or defaults)."""
+    try:
+        from app.config import get_settings
+
+        get_settings.cache_clear()
+        s = get_settings()
+        app_log = getattr(s, "LOG_FILE", "") or LOG_FILE
+        audit_log = getattr(s, "AUDIT_LOG_FILE", "") or ""
+        return app_log, audit_log
+    except Exception:
+        return LOG_FILE, ""
 VERBOSE = False
 API_KEY = os.environ.get("NOTIFICATION_API_KEY", "")
 
@@ -126,18 +142,22 @@ def ensure_server() -> bool:
         kill_port_holder()
 
     print(f"Starting server at {BASE_URL}...")
-    log = open(LOG_FILE, "ab")
+    # Let the server process inherit stdout/stderr so logs appear in the
+    # terminal in real time. The app writes its own rotating log file via the
+    # configured LOG_FILE (we no longer redirect to LOG_FILE here, which
+    # previously caused duplicate log lines).
     cmd = [str(ROOT / "run.sh")]
     if not (ROOT / "run.sh").exists():
         cmd = [str(ROOT / "venv" / "bin" / "uvicorn"), "app.main:app",
                "--host", "127.0.0.1", "--port", str(PORT)]
-    subprocess.Popen(cmd, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+    subprocess.Popen(cmd, cwd=ROOT, stdout=None, stderr=None,
                      start_new_session=True)
 
     for _ in range(30):
         time.sleep(1)
         if server_up():
             print(f"Server ready at {BASE_URL}")
+            print(f"Server logs   : {LOG_FILE}  (view with: python3 notification_service.py logs)")
             return True
     print(f"Server failed to start. Check {LOG_FILE}", file=sys.stderr)
     return False
@@ -434,9 +454,109 @@ def main() -> None:
     elif cmd in ("send-event", "send_event") and rest:
         ensure_server()
         do_send_event(rest[0])
+    elif cmd == "audit":
+        do_audit(rest)
+    elif cmd == "logs":
+        do_logs()
     else:
         usage()
         sys.exit(1)
+
+
+def do_audit(rest: list) -> None:
+    """Show recent durable audit records (who/what/when/which notification/result).
+
+    Reads from the dedicated AUDIT storage (DB `audit_logs` table, and the
+    audit file when configured) — NOT from the application log.
+
+    Usage:
+        python3 notification_service.py audit
+        python3 notification_service.py audit --limit 20
+        python3 notification_service.py audit --user <user_id>
+        python3 notification_service.py audit --file      # read from audit file
+    """
+    limit = 50
+    user_id = None
+    from_file = False
+    for i, a in enumerate(rest):
+        if a == "--limit" and i + 1 < len(rest):
+            try:
+                limit = int(rest[i + 1])
+            except ValueError:
+                limit = 50
+        if a == "--user" and i + 1 < len(rest):
+            user_id = rest[i + 1]
+        if a in ("--file", "-f"):
+            from_file = True
+
+    app_log, audit_file = _log_paths()
+    if audit_file:
+        print(f"Audit file   : {audit_file}")
+
+    if from_file:
+        try:
+            from app.config import get_settings
+            from app.audit import list_audit_from_file
+
+            get_settings.cache_clear()
+            rows = list_audit_from_file(limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error reading audit file: {exc}")
+            sys.exit(1)
+    else:
+        try:
+            from app.config import get_settings
+            from app.audit import list_audit
+
+            get_settings.cache_clear()
+            rows = list_audit(limit=limit, user_id=user_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error reading audit log: {exc}")
+            sys.exit(1)
+    if not rows:
+        print("No audit records found.")
+        return
+    print(f"Audit log (last {len(rows)} records):")
+    for r in rows:
+        ts = str(r.get("timestamp", ""))[:19]
+        print(
+            f"  {ts}  {r.get('action',''):<30} user={r.get('user_id','-')} "
+            f"notif={r.get('notification_id','-')[:8]} channel={r.get('channel','-')} "
+            f"status={r.get('status','-')} result={r.get('result','-')}"
+        )
+
+
+def do_logs() -> None:
+    """Show the application log file (the CLI server writes its logs here).
+
+    Usage:
+        python3 notification_service.py logs            # last 50 lines
+        python3 notification_service.py logs -f         # follow (tail -f)
+    """
+    follow = "-f" in sys.argv or "--follow" in sys.argv
+    app_log, _ = _log_paths()
+    if not os.path.exists(app_log):
+        print(f"No application log yet at {app_log}. Start the server first.")
+        return
+    print(f"Application log: {app_log}")
+    try:
+        if follow:
+            # stream new lines like tail -f
+            with open(app_log, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(0, 2)
+                while True:
+                    line = fh.readline()
+                    if line:
+                        print(line, end="")
+                    else:
+                        time.sleep(0.5)
+        else:
+            with open(app_log, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.readlines()
+            for line in lines[-50:]:
+                print(line, end="")
+    except KeyboardInterrupt:
+        return
 
 
 if __name__ == "__main__":

@@ -1,3 +1,9 @@
+"""
+Application entry point.
+
+Starts FastAPI, initializes the storage layer (SQLite or PostgreSQL), wires
+all routers, and exposes liveness/readiness/health endpoints.
+"""
 import logging
 
 from fastapi import FastAPI, Request
@@ -5,12 +11,14 @@ from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.config import get_settings
-from app.database import init_db
+from app.logging_config import configure_logging
 from app.routers.notifications import router as legacy_router
 from app.routers.v1 import router as v1_router
 from app.routers.webhooks import router as webhook_router
+from app.storage import get_storage
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+configure_logging()
+logger = logging.getLogger("app")
 
 settings = get_settings()
 
@@ -23,12 +31,39 @@ app = FastAPI(
 
 @app.on_event("startup")
 def on_startup() -> None:
-    init_db()
+    logger.info("application startup version=%s mock_mode=%s storage=%s queue=%s",
+                __version__, settings.MOCK_MODE, settings.STORAGE_BACKEND, settings.QUEUE_ENABLED)
+    # Initialize durable storage (source of truth) + schema.
+    get_storage()
+    # Run migrations exactly once per startup. PostgreSQL migrations are
+    # advisory-locked + idempotent, so concurrent containers (api + workers)
+    # never race on CREATE TABLE (no pg_type_typname_nsp_index errors).
+    if settings.STORAGE_BACKEND == "postgres":
+        from app.migrate import up as run_migrations
+
+        n = run_migrations()
+        logger.info("migrations applied this startup: %s", n)
+    # Keep legacy SQLite table available for backward-compatible tooling.
+    try:
+        from app.database import init_db
+
+        init_db()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("legacy sqlite init skipped: %s", exc)
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    logger.info("application shutdown starting")
+    from app.storage import reset_storage
+
+    reset_storage()
+    logger.info("application shutdown complete")
 
 
 @app.exception_handler(Exception)
 def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logging.getLogger("app").exception("Unhandled error on %s", request.url.path)
+    logger.exception("unhandled error on %s", request.url.path)
     return JSONResponse(status_code=500, content={"detail": "Internal server error."})
 
 
@@ -43,6 +78,55 @@ app.include_router(legacy_router)
 app.include_router(webhook_router)
 
 
-@app.get("/health", summary="Health check")
+@app.get("/health", summary="Liveness: process is up")
 def health() -> dict:
     return {"status": "ok", "mock_mode": settings.MOCK_MODE, "version": __version__}
+
+
+@app.get("/api/v1/health/liveness", summary="Liveness check")
+def liveness() -> dict:
+    return {"status": "ok", "service": settings.APP_NAME, "version": __version__}
+
+
+@app.get("/api/v1/health/readiness", summary="Readiness check")
+def readiness() -> JSONResponse:
+    """Ready when the durable storage layer is reachable.
+
+    Queue readiness is included when QUEUE_ENABLED=true. Fails open (ready)
+    on MOCK_MODE so local/dev flows work without real dependencies.
+    """
+    settings = get_settings()
+    checks = {"storage": False, "queue": None}
+    ok = True
+    try:
+        from app.storage import get_storage
+
+        # Probe storage by checking if a simple query works (connectivity check).
+        s = get_storage()
+        if s.backend == "postgres":
+            with s._pg() as conn, conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        else:
+            s.get_notification("readiness-probe")
+        checks["storage"] = True
+    except Exception as exc:  # noqa: BLE001
+        logger.error("readiness storage check failed: %s", exc)
+        ok = False
+
+    if settings.QUEUE_ENABLED:
+        try:
+            from app import queue as q
+
+            q.queue_length("sms")
+            checks["queue"] = True
+        except Exception as exc:  # noqa: BLE001
+            logger.error("readiness queue check failed: %s", exc)
+            checks["queue"] = False
+            ok = False
+
+    if settings.MOCK_MODE and not ok:
+        logger.warning("readiness degraded in mock mode: %s", checks)
+        ok = True
+
+    body = {"status": "ok" if ok else "unavailable", "checks": checks}
+    return JSONResponse(status_code=200 if ok else 503, content=body)

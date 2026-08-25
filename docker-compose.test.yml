@@ -1,0 +1,64 @@
+name: notification-service-test
+
+# Test-only services: run the full pytest suite (with 90% coverage gate)
+# against real PostgreSQL + Redis in containers.
+services:
+  test:
+    build: .
+    image: notification-service:latest
+    command: >
+      sh -c "python3 -m pytest tests/ test_webhooks.py test_vonage_whatsapp.py
+               --cov=app --cov-report=term-missing --cov-fail-under=90"
+    environment:
+      - MOCK_MODE=false
+      - STORAGE_BACKEND=postgres
+      - DATABASE_URL=postgresql://postgres:testpass@postgres:5432/notifications
+      - REDIS_URL=redis://redis:6379/0
+      - QUEUE_ENABLED=false
+      - RATELIMIT_ENABLED=false
+      - AUTH_ENABLED=false
+      - VONAGE_API_KEY=test-key
+      - VONAGE_API_SECRET=test-secret
+      - VONAGE_SMS_FROM=Vonage APIs
+      - VONAGE_WHATSAPP_FROM=14157386102
+      - AZURE_SMS_FROM=+919812345678
+      - AZURE_EMAIL_FROM=DoNotReply@example.com
+      - COMMUNICATION_SERVICES_CONNECTION_STRING=endpoint=https://test.communication.azure.com/;accesskey=test
+      - WHATSAPP_CHANNEL_ID=test-channel
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+
+  migration:
+    image: notification-service:latest
+    command: ["python3", "-m", "app.migrate", "up"]
+    environment:
+      - STORAGE_BACKEND=postgres
+      - DATABASE_URL=postgresql://postgres:testpass@postgres:5432/notifications
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

@@ -1,0 +1,84 @@
+version: 1
+category: idempotency
+evals:
+  - eval_id: EVAL-IDEMPOTENCY-001
+    version: 1
+    scenario: Same request submitted twice with an Idempotency-Key; verify one send.
+    input:
+      endpoint: POST /api/v1/notifications/send
+      body: {channels: [{channel: sms, contact: "+919887270348"}], message: "hello"}
+      headers: {Idempotency-Key: "idem-key-1"}
+      submissions: 2
+    preconditions: {providers_mocked: true}
+    expected_behavior:
+      - "first request accepted (202)"
+      - "second request returns 202 with X-Idempotent-Replay: true"
+      - "provider called once"
+      - "one notification persisted"
+    evidence: [http_statuses, replay_header, provider_call_count, notification_rows]
+    graders:
+      - "both http_status == 202"
+      - "second response has X-Idempotent-Replay: true"
+      - "provider_call_count == 1"
+      - "count(notifications) == 1"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-IDEMPOTENCY-002
+    version: 1
+    scenario: Same user clicks Send twice quickly without a client key; server
+      derives an idempotency key from the identical payload.
+    input:
+      body: {channels: [{channel: sms, contact: "+919887270348"}], message: "confirm"}
+      submissions: 2
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["one effective send", "second is replay/no-op"]
+    evidence: [provider_call_count, notification_rows]
+    graders:
+      - "provider_call_count == 1"
+      - "count(notifications) == 1"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-IDEMPOTENCY-003
+    version: 1
+    scenario: Same user clicks Send 100 times; verify exactly one notification.
+    input: {submissions: 100}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["one notification", "one provider call", "no 500s"]
+    evidence: [notification_rows, provider_call_count, http_statuses]
+    graders:
+      - "count(notifications) == 1"
+      - "provider_call_count == 1"
+      - "no http 500"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-IDEMPOTENCY-004
+    version: 1
+    scenario: Duplicate queue message arrives; worker must not re-send.
+    input: {queue_redelivery: true}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["provider called once", "second delivery is no-op"]
+    evidence: [provider_call_count, notification_state]
+    graders:
+      - "provider_call_count == 1"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-IDEMPOTENCY-005
+    version: 1
+    scenario: Provider accepts the request but the response is lost (timeout);
+      worker must verify status instead of blind retry.
+    input: {provider_behavior: accept_then_timeout}
+    preconditions: {providers_mocked: true}
+    expected_behavior:
+      - "worker verifies via provider status if available"
+      - "no resend when already submitted"
+      - "residual double-send risk documented if provider lacks verify"
+    evidence: [provider_call_count, notification_state]
+    graders:
+      - "provider_call_count <= 2 (verify, not duplicate send)"
+      - "final status submitted"
+    critical: true
+    pass_criteria: "all graders pass"

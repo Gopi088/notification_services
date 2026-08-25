@@ -2,15 +2,14 @@
 Notification orchestrator.
 
 Responsibilities:
-- Accept a validated send request, create one queued record per channel,
-  grouped under a single group_id.
-- Route each channel to ITS OWN provider only (sms -> sms provider,
-  whatsapp -> whatsapp provider, email -> email provider). No cross-channel
-  access.
-- Update per-channel status in the background and mark failures with reason.
-
-Adding a new channel later = add a provider + register it in the factory;
-the orchestrator needs no change.
+- Accept a validated send request, create one queued record per channel
+  (in PostgreSQL via the storage layer), grouped under a single group_id.
+- When QUEUE_ENABLED=true, publish each channel to Redis Streams for
+  asynchronous worker delivery (docs/04 + 05). The API never performs slow
+  provider delivery inline.
+- When QUEUE_ENABLED=false (dev/fallback), dispatch delivery in-process via
+  BackgroundTasks using the same provider layer (backward compatible).
+- Status summaries read from the storage layer (durable source of truth).
 """
 import logging
 import threading
@@ -20,54 +19,88 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config import get_settings
-from app.database import create_message, get_group, get_message, update_status
 from app.providers.base import ProviderError, ProviderResult
 from app.providers.factory import get_provider
 from app.schemas import Channel, NotificationEventRequest, SendRequest
+from app.storage import (
+    FAILED,
+    PROCESSING,
+    QUEUED,
+    SUBMITTED,
+    get_storage,
+)
 
 logger = logging.getLogger("orchestrator")
 
 
-def _safe_send(message_id: str, channel: Channel, fn: Callable[..., ProviderResult]) -> None:
-    """
-    Run one provider send and persist its outcome. Never leaves a message
-    'queued' forever: any failure is recorded with the reason.
-    """
+def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., ProviderResult]) -> None:
+    """Run one provider send and persist its outcome. Never leaves a message
+    'queued' forever: any failure is recorded with the reason."""
+    storage = get_storage()
+    # queued/retrying -> processing (guarded; if already processing by another
+    # dispatcher, the transition returns unchanged and we proceed).
+    from app.audit import record_audit
+
+    storage.transition(notification_id, PROCESSING, actor="orchestrator")
     try:
         result = fn()
     except ProviderError as exc:
-        logger.warning("message %s failed via %s: %s", message_id, channel.value, exc)
-        update_status(message_id, status="failed", error=str(exc))
+        logger.warning(
+            "message %s failed via %s: %s (retryable=%s)",
+            notification_id, channel.value, exc, getattr(exc, "retryable", False),
+        )
+        storage.transition(
+            notification_id, FAILED, actor="orchestrator",
+            error=str(exc),
+        )
+        row = storage.get_notification(notification_id)
+        record_audit(
+            user_id=row.get("created_by") if row else None,
+            action="notification_failed", notification_id=notification_id,
+            channel=channel.value, status="failed", result="failure",
+            failure_reason=str(exc),
+        )
         return
     except Exception as exc:  # noqa: BLE001 - never leave a message 'queued' forever
-        logger.exception("unexpected error sending message %s", message_id)
-        update_status(message_id, status="failed", error=f"Unexpected error: {exc}")
+        logger.exception("unexpected error sending message %s", notification_id)
+        storage.transition(
+            notification_id, FAILED, actor="orchestrator",
+            error=f"Unexpected error: {exc}",
+        )
         return
 
-    update_status(
-        message_id,
-        status=result.status,
+    storage.transition(
+        notification_id,
+        to_status=SUBMITTED,
         provider=result.provider_name,
         provider_message_id=result.provider_message_id,
+        actor="orchestrator",
     )
-    _maybe_simulate_delivery(message_id)
+    row = storage.get_notification(notification_id)
+    record_audit(
+        user_id=row.get("created_by") if row else None,
+        action="notification_submitted", notification_id=notification_id,
+        channel=channel.value, status="submitted",
+        provider=result.provider_name,
+    )
+    _maybe_simulate_delivery(notification_id)
 
 
-def _maybe_simulate_delivery(message_id: str) -> None:
+def _maybe_simulate_delivery(notification_id: str) -> None:
     """In MOCK_MODE, simulate the delivery receipt a moment after the send so
-    the full queued -> sent -> delivered lifecycle stays observable."""
+    the full queued -> processing -> submitted -> delivered lifecycle is visible."""
     if not get_settings().MOCK_MODE:
         return
 
     def _go() -> None:
         time.sleep(1.5)
-        update_status(message_id, status="delivered")
+        get_storage().transition(notification_id, "delivered", actor="mock")
 
     threading.Thread(target=_go, daemon=True).start()
 
 
 def _send_one(
-    message_id: str,
+    notification_id: str,
     channel: Channel,
     contact: str,
     message: str,
@@ -75,7 +108,7 @@ def _send_one(
     template_language: Optional[str],
     template_params: Optional[Dict[str, str]],
 ) -> None:
-    """Deliver a single message through its own channel provider."""
+    """Deliver a single message through its own channel provider (in-process path)."""
     settings = get_settings()
 
     def _do() -> ProviderResult:
@@ -90,47 +123,83 @@ def _send_one(
             )
         return provider.send(contact, message)
 
-    _safe_send(message_id, channel, _do)
+    _safe_send(notification_id, channel, _do)
 
 
-def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
-    """
-    Queue each channel of `req` under one group_id and dispatch delivery via
-    FastAPI BackgroundTasks (runs after the response is sent).
+def _dispatch(notification_id: str, channel: Channel, cr, message: str,
+              params: Optional[Dict], group_id: str, reference: Optional[str],
+              background_tasks) -> None:
+    """Dispatch one channel either to the queue (async) or in-process (fallback)."""
+    settings = get_settings()
+    if settings.QUEUE_ENABLED:
+        from app import queue as q
 
-    Returns the group-level summary used for the 202 response.
-    """
-    group_id = str(uuid.uuid4())
-    queued: List[Dict] = []
-
-    for cr in req.channels:
-        message_id = str(uuid.uuid4())
-        params = {p.name: p.value for p in cr.template_params} if cr.template_params else None
-        create_message(
-            message_id=message_id,
-            channel=cr.channel.value,
-            contact=cr.contact,
-            message=req.message,
-            status="queued",
-            group_id=group_id,
-            reference=req.reference,
+        recipient = cr.contact
+        q.publish(channel.value, notification_id, group_id, recipient, attempt=1)
+        logger.info(
+            "notification queued notification_id=%s channel=%s group_id=%s",
+            notification_id, channel.value, group_id,
         )
-        queued.append({
-            "message_id": message_id,
-            "channel": cr.channel.value,
-            "status": "queued",
-            "contact": cr.contact,
-        })
+    else:
         background_tasks.add_task(
             _send_one,
-            message_id,
-            cr.channel,
+            notification_id,
+            channel,
             cr.contact,
-            req.message,
+            message,
             cr.template_name,
             cr.template_language,
             params,
         )
+
+
+def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
+    """
+    Queue each channel of `req` under one group_id and dispatch delivery.
+
+    QUEUE_ENABLED=true  → publish to Redis Streams (workers deliver).
+    QUEUE_ENABLED=false → BackgroundTasks (backward compatible).
+
+    Returns the group-level summary used for the 202 response.
+    """
+    storage = get_storage()
+    settings = get_settings()
+    group_id = str(uuid.uuid4())
+    queued: List[Dict] = []
+
+    for cr in req.channels:
+        notification_id = str(uuid.uuid4())
+        params = {p.name: p.value for p in cr.template_params} if cr.template_params else None
+        internal_id = storage.create_notification(
+            message_id=notification_id,
+            channel=cr.channel.value,
+            recipient=cr.contact,
+            message=req.message,
+            status=QUEUED,
+            group_id=group_id,
+            reference=req.reference,
+            template_name=cr.template_name,
+            template_language=cr.template_language,
+            template_params=params,
+            request_id=getattr(req, "_request_id", None),
+            created_by=getattr(req, "_user_id", None),
+            max_attempts=settings.MAX_ATTEMPTS,
+        )
+        from app.audit import record_audit
+        record_audit(
+            user_id=getattr(req, "_user_id", None),
+            action="notification_created", notification_id=notification_id,
+            channel=cr.channel.value, recipient=cr.contact, status=QUEUED,
+            request_id=getattr(req, "_request_id", None),
+        )
+        queued.append({
+            "message_id": notification_id,
+            "channel": cr.channel.value,
+            "status": "queued",
+            "contact": cr.contact,
+        })
+        _dispatch(internal_id, cr.channel, cr, req.message, params, group_id,
+                  req.reference, background_tasks)
 
     return {
         "message_id": group_id,
@@ -156,58 +225,68 @@ def _delivery_message(channel: Channel, payload: Dict[str, Any], data: Any = Non
 
 
 def _send_delivery(
-    message_id: str,
+    notification_id: str,
     channel: Channel,
     payload: Dict[str, Any],
     data: Any,
 ) -> None:
-    """Deliver one event delivery through its own channel provider."""
+    """Deliver one event delivery through its own channel provider (in-process path)."""
 
     def _do() -> ProviderResult:
         return get_provider(channel).send_delivery(payload, data)
 
-    _safe_send(message_id, channel, _do)
+    _safe_send(notification_id, channel, _do)
 
 
 def orchestrate_event(req: NotificationEventRequest, background_tasks) -> Dict:
     """
     Queue each delivery of an event envelope under one group_id and dispatch
-    delivery via FastAPI BackgroundTasks (runs after the response is sent).
-
-    Each delivery carries its own recipient and channel-specific payload
-    (WhatsApp template, SMS message, rich email with cc/bcc/attachments).
+    delivery via the queue (or BackgroundTasks when QUEUE_ENABLED=false).
     """
+    storage = get_storage()
+    settings = get_settings()
     group_id = str(uuid.uuid4())
     reference = req.ref or req.request_id
     queued: List[Dict] = []
 
     for delivery in req.deliveries:
-        message_id = str(uuid.uuid4())
+        notification_id = str(uuid.uuid4())
         payload = delivery.payload.model_dump(by_alias=True)
         contact = payload.get("recipient", "")
         message = _delivery_message(delivery.channel, payload, req.data)
-        create_message(
-            message_id=message_id,
+        internal_id = storage.create_notification(
+            message_id=notification_id,
             channel=delivery.channel.value,
-            contact=contact,
+            recipient=contact,
             message=message,
-            status="queued",
+            status=QUEUED,
             group_id=group_id,
             reference=reference,
+            subject=payload.get("subject"),
+            template_name=(payload.get("template") or {}).get("id") if delivery.channel == Channel.whatsapp else None,
+            request_id=getattr(req, "_request_id", None),
+            created_by=getattr(req, "_user_id", None),
+            max_attempts=settings.MAX_ATTEMPTS,
         )
         queued.append({
-            "message_id": message_id,
+            "message_id": notification_id,
             "channel": delivery.channel.value,
             "status": "queued",
             "contact": contact,
         })
-        background_tasks.add_task(
-            _send_delivery,
-            message_id,
-            delivery.channel,
-            payload,
-            req.data,
-        )
+        if settings.QUEUE_ENABLED:
+            from app import queue as q
+
+            q.publish(delivery.channel.value, internal_id, group_id, contact, attempt=1)
+            logger.info("notification queued notification_id=%s channel=%s", notification_id, delivery.channel.value)
+        else:
+            background_tasks.add_task(
+                _send_delivery,
+                internal_id,
+                delivery.channel,
+                payload,
+                req.data,
+            )
 
     return {
         "message_id": group_id,
@@ -217,12 +296,10 @@ def orchestrate_event(req: NotificationEventRequest, background_tasks) -> Dict:
 
 
 def _delivery_detail(row) -> Dict:
-    """Compute elapsed time and timeout flag for a message row.
+    """Compute elapsed time and timeout flag for a notification row.
 
     - elapsed_seconds: how long since the message was created.
-    - timed_out: True when the message is still queued/sent and has been
-      waiting longer than DELIVERY_TIMEOUT_SECONDS. This tells callers when
-      to stop polling and treat the send as stuck.
+    - timed_out: True when still queued/processing and longer than timeout.
     """
     timeout = get_settings().DELIVERY_TIMEOUT_SECONDS
     detail = {
@@ -230,11 +307,11 @@ def _delivery_detail(row) -> Dict:
         "elapsed_seconds": None,
         "timed_out": False,
     }
-    created_raw = row["created_at"]
+    created_raw = row.get("created_at")
     if not created_raw:
         return detail
     try:
-        created = datetime.fromisoformat(created_raw)
+        created = datetime.fromisoformat(str(created_raw).replace("Z", "+00:00"))
     except ValueError:
         return detail
 
@@ -244,30 +321,31 @@ def _delivery_detail(row) -> Dict:
     elapsed = (now - created).total_seconds()
     detail["elapsed_seconds"] = round(elapsed, 1)
 
-    if row["status"] in ("queued", "sent") and elapsed > timeout:
+    if row.get("status") in ("queued", "processing", "retrying") and elapsed > timeout:
         detail["timed_out"] = True
     return detail
 
 
 def get_group_summary(group_id: str) -> Optional[Dict]:
     """Aggregate per-channel statuses for one group into a public summary."""
-    rows = get_group(group_id)
+    storage = get_storage()
+    rows = storage.get_group(group_id)
     if not rows:
         return None
 
     channels = []
     reference = None
     for row in rows:
-        reference = row["reference"] if row["reference"] else reference
+        reference = row.get("reference") if row.get("reference") else reference
         detail = _delivery_detail(row)
         channels.append({
             "message_id": row["message_id"],
             "channel": row["channel"],
-            "contact": row["contact"],
+            "contact": row["recipient"],
             "status": row["status"],
-            "provider": row["provider"],
-            "provider_message_id": row["provider_message_id"],
-            "error": row["error"],
+            "provider": row.get("provider"),
+            "provider_message_id": row.get("provider_message_id"),
+            "error": row.get("last_error"),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             **detail,
@@ -276,9 +354,9 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
     statuses = {c["status"] for c in channels}
     if statuses == {"delivered"}:
         overall = "delivered"
-    elif statuses == {"failed"}:
+    elif statuses == {"failed"} or statuses == {"dead_lettered"}:
         overall = "failed"
-    elif "failed" in statuses:
+    elif "failed" in statuses or "dead_lettered" in statuses:
         overall = "partial"
     elif statuses <= {"queued"}:
         overall = "queued"
@@ -289,19 +367,20 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
 
 
 def get_message_summary(message_id: str) -> Optional[Dict]:
-    row = get_message(message_id)
+    storage = get_storage()
+    row = storage.get_notification_by_message_id(message_id)
     if row is None:
         return None
     detail = _delivery_detail(row)
     return {
         "message_id": row["message_id"],
-        "group_id": row["group_id"],
+        "group_id": row.get("group_id"),
         "channel": row["channel"],
-        "contact": row["contact"],
+        "contact": row["recipient"],
         "status": row["status"],
-        "provider": row["provider"],
-        "provider_message_id": row["provider_message_id"],
-        "error": row["error"],
+        "provider": row.get("provider"),
+        "provider_message_id": row.get("provider_message_id"),
+        "error": row.get("last_error"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         **detail,

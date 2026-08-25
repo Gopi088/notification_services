@@ -31,6 +31,75 @@ class Settings(BaseSettings):
     # the webhook; this threshold tells callers when to stop waiting.
     DELIVERY_TIMEOUT_SECONDS: int = 300
 
+    # --- Storage / Database ---
+    # Storage backend: "sqlite" (dev/fallback) or "postgres" (production).
+    # PostgreSQL is the durable source of truth in the target architecture.
+    STORAGE_BACKEND: str = "sqlite"
+    # SQLite file path (used when STORAGE_BACKEND=sqlite).
+    DATABASE_PATH: str = "notifications.db"
+    # PostgreSQL DSN (used when STORAGE_BACKEND=postgres).
+    # Example: postgresql://user:pass@localhost:5432/notifications
+    DATABASE_URL: str = ""
+    DB_POOL_MIN: int = 1
+    DB_POOL_MAX: int = 10
+
+    # --- Queue / Redis Streams ---
+    # If true, the API enqueues notifications to Redis Streams and workers
+    # deliver them asynchronously. If false, delivery happens in-process via
+    # BackgroundTasks (backward-compatible fallback for dev).
+    QUEUE_ENABLED: bool = False
+    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_PASSWORD: str = ""
+    # Stream namespaces (per channel). Retry/DLQ streams are derived from these.
+    QUEUE_STREAM_PREFIX: str = "notifications"
+    QUEUE_MESSAGE_MAX_BYTES: int = 65536
+    # Consumer group name shared by all workers of the same stream.
+    QUEUE_CONSUMER_GROUP: str = "workers"
+    # Visibility timeout for XAUTOCLAIM (ms) - how long before a pending
+    # message is reclaimed after a worker dies.
+    QUEUE_VISIBILITY_TIMEOUT_MS: int = 30000
+    # Block time (ms) for XREADGROUP.
+    QUEUE_BLOCK_MS: int = 5000
+
+    # --- Worker ---
+    WORKER_CONCURRENCY: int = 4
+    WORKER_GRACE_SECONDS: int = 30
+    WORKER_CONCURRENCY_WHATSAPP: int = 2
+    WORKER_CONCURRENCY_SMS: int = 4
+    WORKER_CONCURRENCY_EMAIL: int = 4
+
+    # --- Retry ---
+    MAX_ATTEMPTS: int = 5
+    RETRY_BASE_DELAY_MS: int = 5000
+    RETRY_MAX_DELAY_MS: int = 120000
+    RETRY_JITTER_RATIO: float = 0.2
+
+    # --- Idempotency ---
+    # Client Idempotency-Key header TTL (seconds). Must cover the retry horizon.
+    IDEMPOTENCY_TTL_SECONDS: int = 86400
+
+    # --- Rate limiting ---
+    RATELIMIT_ENABLED: bool = False
+    RATE_LIMIT_PER_KEY: int = 100
+    RATE_LIMIT_PER_KEY_WINDOW_SECONDS: int = 60
+    RATE_LIMIT_PER_RECIPIENT: int = 20
+    RATE_LIMIT_PER_RECIPIENT_WINDOW_SECONDS: int = 3600
+    RATE_LIMIT_PER_CHANNEL: int = 500
+    RATE_LIMIT_PER_CHANNEL_WINDOW_SECONDS: int = 60
+
+    # --- Observability ---
+    LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "text"  # "text" (dev) or "json" (structured)
+    LOG_REDACT_KEYS: str = ""  # extra comma-separated field names to redact
+    # Application log file (optional). When set, logs are also written to a
+    # rotating file (in addition to stdout/stderr). Empty = stdout only.
+    LOG_FILE: str = ""
+    LOG_FILE_MAX_BYTES: int = 10 * 1024 * 1024  # 10 MB
+    LOG_FILE_BACKUPS: int = 5
+    # Audit log file (JSON lines) - separate from application logs. When set,
+    # audit records are also appended here (durable even if DB is unavailable).
+    AUDIT_LOG_FILE: str = ""
+
     # --- Vonage SMS (alternative SMS provider to Azure) ---
     # If VONAGE_API_KEY and VONAGE_API_SECRET are set, the SMS channel uses
     # Vonage instead of Azure. Credentials from the Vonage dashboard.

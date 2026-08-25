@@ -1,0 +1,68 @@
+version: 1
+category: concurrency
+evals:
+  - eval_id: EVAL-CONCURRENCY-001
+    version: 1
+    scenario: 100 users submit notifications simultaneously; verify no loss, no
+      duplicates, no ownership corruption, queue integrity, and DB consistency.
+    input:
+      concurrent_requests: 100
+      users: [usr_1..usr_100]
+      endpoint: POST /api/v1/notifications/send
+      body_per_user: {channels: [{channel: sms, contact: "+919887270348"}], message: "hi"}
+    preconditions:
+      - providers_mocked: true
+      - queue_enabled: true
+      - workers_running: 2
+    expected_behavior:
+      - "all 100 requests accepted (202)"
+      - "100 notifications persisted, one per user"
+      - "no unintended duplicates"
+      - "ownership: created_by matches each user"
+      - "queue receives 100 messages"
+      - "workers process all 100"
+      - "final status submitted for all"
+    evidence:
+      - http_statuses
+      - notification_rows
+      - created_by_values
+      - queue_length
+      - worker_processed_count
+      - database_consistency_check
+    graders:
+      - "count(accepted) == 100"
+      - "count(notifications) == 100"
+      - "count(distinct notification_id) == 100"
+      - "all created_by match expected user"
+      - "queue consumed all messages (pending == 0)"
+      - "all status == submitted"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-CONCURRENCY-002
+    version: 1
+    scenario: 10 concurrent requests from the same user with distinct messages.
+    input: {concurrent_requests: 10, same_user: true}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["all accepted", "10 distinct notifications", "no duplicates"]
+    evidence: [http_statuses, notification_rows]
+    graders:
+      - "count(accepted) == 10"
+      - "count(distinct message_id) == 10"
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-CONCURRENCY-003
+    version: 1
+    scenario: 1000 requests where the environment supports it; verify queue absorbs
+      backlog and workers drain at provider rate without loss.
+    input: {concurrent_requests: 1000}
+    preconditions: {providers_mocked: true, rate_limits_disabled: true}
+    expected_behavior: ["no notification loss", "queue backlog drains", "all processed"]
+    evidence: [notification_rows, queue_length, worker_processed_count]
+    graders:
+      - "count(notifications) == count(accepted)"
+      - "final queue pending == 0"
+      - "all status in (submitted, delivered)"
+    critical: false
+    pass_criteria: "all graders pass"

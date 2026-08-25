@@ -1,0 +1,114 @@
+version: 1
+category: regression
+evals:
+  - eval_id: EVAL-REGRESSION-SMS-001
+    version: 1
+    scenario: SMS channel regression — real provider path (mocked) still works.
+    input:
+      channel: sms
+      endpoint: POST /api/v1/notifications/send
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["202", "submitted", "provider vonage_sms selected"]
+    evidence: [http_status, notification_state, provider]
+    graders: ["http_status == 202", "final status submitted", "provider == vonage_sms"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-WHATSAPP-001
+    version: 1
+    scenario: WhatsApp channel regression (Vonage sandbox, mocked).
+    input: {channel: whatsapp}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["202", "submitted", "provider vonage_whatsapp selected"]
+    evidence: [http_status, notification_state, provider]
+    graders: ["http_status == 202", "final status submitted", "provider == vonage_whatsapp"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-EMAIL-001
+    version: 1
+    scenario: Email channel regression (Azure, mocked).
+    input: {channel: email}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["202", "submitted", "provider azure_email selected"]
+    evidence: [http_status, notification_state, provider]
+    graders: ["http_status == 202", "final status submitted", "provider == azure_email"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-DUPLICATE-001
+    version: 1
+    scenario: Duplicate prevention regression — 100 clicks, one notification.
+    input: {submissions: 100}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["one notification", "one provider call"]
+    evidence: [notification_rows, provider_call_count]
+    graders: ["count(notifications) == 1", "provider_call_count == 1"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-IDEMPOTENCY-001
+    version: 1
+    scenario: Idempotency regression — duplicate queue message no double-send.
+    input: {queue_redelivery: true}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["provider called once"]
+    evidence: [provider_call_count]
+    graders: ["provider_call_count == 1"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-PERSISTENCE-001
+    version: 1
+    scenario: Notification persistence regression — every accepted send is stored.
+    input: {sends: 5}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["5 notifications persisted"]
+    evidence: [notification_rows]
+    graders: ["count(notifications) == 5"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-QUEUE-001
+    version: 1
+    scenario: Queue reliability regression — publish/consume/ack round trip.
+    input: {messages: 1}
+    preconditions: {queue_enabled: true, providers_mocked: true}
+    expected_behavior: ["published", "consumed", "acked", "no pending"]
+    evidence: [queue_state]
+    graders: ["pending == 0", "delivered to worker"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-AUTHZ-001
+    version: 1
+    scenario: Authorization regression — cross-user access denied.
+    input: {actor: usr_A, resource: usr_B_notification}
+    preconditions: {auth_enabled: true}
+    expected_behavior: ["403"]
+    evidence: [http_status]
+    graders: ["http_status == 403"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-SECRET-001
+    version: 1
+    scenario: Secret-leak regression — no secrets in responses/logs.
+    input: {scan: "responses and logs"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["no secret values present"]
+    evidence: [response_body, logs]
+    graders: ["no secret in response", "no secret in logs"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-REGRESSION-AUDIT-001
+    version: 1
+    scenario: Audit integrity regression — key events recorded.
+    input: {trigger: "send + duplicate + fail"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["audit rows for created/sent/failed/duplicate"]
+    evidence: [audit_rows]
+    graders: ["audit contains expected event actions"]
+    critical: true
+    pass_criteria: "all graders pass"

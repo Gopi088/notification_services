@@ -137,37 +137,66 @@ class VonageWhatsAppProvider(NotificationProvider):
                 json=payload,
                 timeout=30,
             )
-        except requests.RequestException as exc:  # network / timeout
+        except requests.RequestException as exc:  # network / timeout (retryable)
             logger.error("[WhatsApp] Vonage request failed: %s", exc)
-            raise ProviderError(f"Vonage WhatsApp network error: {exc}") from exc
+            raise ProviderError(
+                f"Vonage WhatsApp network error: {exc}", retryable=True, error_code="NETWORK"
+            ) from exc
 
         if response.status_code == 401:
             raise ProviderError(
                 "Vonage WhatsApp authentication failed (401). Check VONAGE_API_KEY "
-                "and VONAGE_API_SECRET."
+                "and VONAGE_API_SECRET.",
+                retryable=False,
+                error_code=str(response.status_code),
             )
         if response.status_code == 403:
             raise ProviderError(
                 "Vonage WhatsApp rejected the request (403). The recipient number "
-                "may not be allow-listed in the Vonage Messages Sandbox."
+                "may not be allow-listed in the Vonage Messages Sandbox.",
+                retryable=False,
+                error_code=str(response.status_code),
+            )
+        if response.status_code == 429:
+            raise ProviderError(
+                f"Vonage WhatsApp rate limited (429): {response.text}",
+                retryable=True,
+                error_code="429",
+            )
+        if response.status_code >= 500:
+            logger.error("[WhatsApp] Vonage rejected message: %s", response.text)
+            raise ProviderError(
+                f"Vonage WhatsApp error ({response.status_code}): {response.text}",
+                retryable=True,
+                error_code=str(response.status_code),
             )
         if response.status_code >= 400:
             logger.error("[WhatsApp] Vonage rejected message: %s", response.text)
             raise ProviderError(
-                f"Vonage WhatsApp error ({response.status_code}): {response.text}"
+                f"Vonage WhatsApp error ({response.status_code}): {response.text}",
+                retryable=False,
+                error_code=str(response.status_code),
             )
 
         try:
             result = response.json()
         except ValueError as exc:
-            raise ProviderError(f"Vonage WhatsApp invalid response: {response.text}") from exc
+            raise ProviderError(
+                f"Vonage WhatsApp invalid response: {response.text}",
+                retryable=False,
+                error_code="BAD_RESPONSE",
+            ) from exc
 
         message_id = result.get("message_uuid")
         if not message_id:
-            raise ProviderError(f"Vonage WhatsApp returned no message id: {result}")
+            raise ProviderError(
+                f"Vonage WhatsApp returned no message id: {result}",
+                retryable=False,
+                error_code="NO_MESSAGE_ID",
+            )
 
         logger.info("[WhatsApp] Vonage message ID: %s | Provider accepted message", message_id)
-        return ProviderResult(self.name, message_id, "sent")
+        return ProviderResult(self.name, message_id, "submitted")
 
     def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
         recipient = payload.get("recipient", "")

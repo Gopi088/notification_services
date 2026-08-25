@@ -34,6 +34,7 @@ def _test_env(**overrides):
 
     base = {
         "MOCK_MODE": "false",
+        "RATELIMIT_ENABLED": "false",
         "VONAGE_API_KEY": "test-key",
         "VONAGE_API_SECRET": "test-secret",
         "VONAGE_WHATSAPP_FROM": "14157386102",
@@ -81,7 +82,7 @@ def test_success_sends_correct_payload(client=None):
 
     assert result.provider_name == "vonage_whatsapp"
     assert result.provider_message_id == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    assert result.status == "sent"
+    assert result.status == "submitted"
 
 
 def test_success_existing_number_with_plus(client=None):
@@ -239,26 +240,34 @@ def test_secret_not_exposed_in_errors(client=None):
 
 def test_endpoint_whatsapp_regression(client=None):
     """POST /api/v1/notifications/send with channel=whatsapp reaches the provider."""
+    import uuid
+
     from fastapi.testclient import TestClient
     from app.main import app
 
     with _test_env():
-        with patch("app.providers.vonage_provider.requests.post") as mock_post:
-            mock_post.return_value = _FakeResponse(
-                200, _json.dumps({"message_uuid": "22222222-3333-4444-5555-666666666666"})
-            )
-            client = TestClient(app)
-            resp = client.post(
-                "/api/v1/notifications/send",
-                json={
-                    "channels": [{"channel": "whatsapp", "contact": "9887270348"}],
-                    "message": "hi",
-                },
-            )
-            assert resp.status_code == 202, resp.text
-            body = resp.json()
-            assert body["channels"][0]["channel"] == "whatsapp"
-            assert mock_post.call_count >= 1
+        import fakeredis
+        server = fakeredis.FakeServer()
+        fake_r = fakeredis.FakeRedis(server=server, decode_responses=True)
+        import app.idempotency as idem_mod
+        from unittest.mock import patch as _patch
+        with _patch.object(idem_mod, "_redis", lambda: fake_r):
+            with _patch("app.providers.vonage_provider.requests.post") as mock_post:
+                mock_post.return_value = _FakeResponse(
+                    200, _json.dumps({"message_uuid": "22222222-3333-4444-5555-666666666666"})
+                )
+                client = TestClient(app)
+                resp = client.post(
+                    "/api/v1/notifications/send",
+                    json={
+                        "channels": [{"channel": "whatsapp", "contact": "9887270348"}],
+                        "message": f"hi-{uuid.uuid4().hex[:6]}",
+                    },
+                )
+                assert resp.status_code == 202, resp.text
+                body = resp.json()
+                assert body["channels"][0]["channel"] == "whatsapp"
+                assert mock_post.call_count >= 1
 
 
 if __name__ == "__main__":

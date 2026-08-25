@@ -1,10 +1,10 @@
 .env
-__pycache__/
-*.pyc
 .venv/
 venv/
-notifications.db
-.env
-*.db
 __pycache__/
+.pytest_cache/
+.coverage
 *.pyc
+*.db
+notifications.db
+logs/

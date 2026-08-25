@@ -1,0 +1,64 @@
+version: 1
+category: retry
+evals:
+  - eval_id: EVAL-RETRY-001
+    version: 1
+    scenario: Retryable provider failure triggers backoff then success.
+    input:
+      fail_count: 2
+      then_succeed: true
+      max_attempts: 5
+    preconditions: {providers_mocked: true, fail_mode: "retryable_twice_then_ok"}
+    expected_behavior:
+      - "attempts 1-2 fail retryable"
+      - "status retrying between attempts"
+      - "attempt 3 succeeds"
+      - "final status submitted"
+      - "audit records retry"
+    evidence: [attempt_history, notification_state, audit_rows]
+    graders:
+      - "attempt count == 3"
+      - "final status == submitted"
+      - "audit contains notification_retrying"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-RETRY-002
+    version: 1
+    scenario: Retryable failure exhausts max attempts; verify dead-letter.
+    input: {fail_count: 5, max_attempts: 5}
+    preconditions: {providers_mocked: true, fail_mode: "always_retryable"}
+    expected_behavior: ["5 attempts", "dead_lettered", "dlq entry", "no retry beyond max"]
+    evidence: [attempt_history, notification_state, dlq_entries]
+    graders:
+      - "attempt count == 5"
+      - "final status == dead_lettered"
+      - "dlq entry exists"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-RETRY-003
+    version: 1
+    scenario: Non-retryable error (invalid recipient) fails immediately, no retry.
+    input: {error: "invalid recipient", retryable: false}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["one attempt", "status failed", "no retry scheduled"]
+    evidence: [attempt_history, notification_state]
+    graders:
+      - "attempt count == 1"
+      - "final status == failed"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-RETRY-004
+    version: 1
+    scenario: Retry storm protection — backoff includes jitter and bounds.
+    input: {many_failing: 50}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["backoff within bounds", "no unbounded concurrency", "no retry storm"]
+    evidence: [backoff_samples, queue_retry_depth]
+    graders:
+      - "all backoff samples within [min, max]"
+      - "retry stream bounded"
+    critical: false
+    pass_criteria: "all graders pass"

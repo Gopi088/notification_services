@@ -1,0 +1,99 @@
+version: 1
+category: functional
+evals:
+  - eval_id: EVAL-FUNCTIONAL-001
+    version: 1
+    scenario: Send a valid SMS notification through the API; provider mocked.
+    input:
+      endpoint: POST /api/v1/notifications/send
+      body: {channels: [{channel: sms, contact: "+919887270348"}], message: "hello"}
+    preconditions:
+      - providers_mocked: true
+      - storage_ready: true
+    expected_behavior:
+      - "API returns 202"
+      - "notification persisted with status queued"
+      - "provider called exactly once"
+      - "final status submitted"
+    evidence:
+      - http_status
+      - notification_state
+      - provider_call_count
+      - database_row
+    graders:
+      - "http_status == 202"
+      - "notification.status == queued after send"
+      - "provider_call_count == 1"
+      - "notification.status == submitted after worker"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-FUNCTIONAL-002
+    version: 1
+    scenario: Send a valid WhatsApp template notification.
+    input:
+      endpoint: POST /api/v1/notifications/send
+      body: {channels: [{channel: whatsapp, contact: "+919887270348", template_name: "test_template"}], message: "hi"}
+    preconditions:
+      - providers_mocked: true
+      - vonage_whatsapp_selected: true
+    expected_behavior:
+      - "API returns 202"
+      - "provider called with whatsapp channel"
+      - "final status submitted"
+    evidence: [http_status, provider_call_count, notification_state]
+    graders:
+      - "http_status == 202"
+      - "provider_call_count == 1"
+      - "notification.status == submitted"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-FUNCTIONAL-003
+    version: 1
+    scenario: Send a valid email notification with subject.
+    input:
+      endpoint: POST /api/v1/notifications/send
+      body: {channels: [{channel: email, contact: "a@b.com"}], message: "hello"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["API returns 202", "final status submitted"]
+    evidence: [http_status, notification_state]
+    graders: ["http_status == 202", "notification.status == submitted"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-FUNCTIONAL-004
+    version: 1
+    scenario: Event-driven send with one delivery per channel.
+    input:
+      endpoint: POST /api/v1/notifications/event
+      body: {event_type: "test", data: "x", deliveries: [{channel: sms, payload: {recipient: "+919887270348", message: "hi"}}]}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["API returns 202", "delivery processed"]
+    evidence: [http_status, notification_state]
+    graders: ["http_status == 202"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-FUNCTIONAL-005
+    version: 1
+    scenario: Status retrieval for an existing notification.
+    input:
+      endpoint: GET /api/v1/notifications/{id}/status
+    preconditions: {notification_exists: true}
+    expected_behavior: ["HTTP 200", "status field present"]
+    evidence: [http_status, response_body]
+    graders: ["http_status == 200", "response has status"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-FUNCTIONAL-006
+    version: 1
+    scenario: Status retrieval for a nonexistent notification returns 404.
+    input: {endpoint: GET /api/v1/notifications/missing/status}
+    preconditions: {}
+    expected_behavior: ["HTTP 404"]
+    evidence: [http_status]
+    graders: ["http_status == 404"]
+    critical: false
+    pass_criteria: "all graders pass"

@@ -1,0 +1,105 @@
+name: notification-service
+
+# Secrets are NOT hardcoded here. All credentials come from the `.env` file
+# (gitignored) via env_file. Provider keys are read from environment, never
+# committed.
+x-app-base: &app-base
+  image: notification-service:latest
+  env_file: .env
+  environment:
+    - MOCK_MODE=${MOCK_MODE:-false}
+    - STORAGE_BACKEND=${STORAGE_BACKEND:-postgres}
+    - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-notifications}@postgres:5432/notifications
+    - REDIS_URL=redis://redis:6379/0
+    - QUEUE_ENABLED=${QUEUE_ENABLED:-true}
+    - LOG_FILE=logs/app.log
+    - AUDIT_LOG_FILE=logs/audit.log
+    - LOG_LEVEL=INFO
+  volumes:
+    - ./logs:/app/logs
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+    migration:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: notifications
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-notifications}
+    # No host port exposed: containers communicate internally via postgres:5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    # No host port exposed: containers communicate internally via redis:6379
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Runs schema migrations exactly once before api/workers start.
+  migration:
+    image: notification-service:latest
+    env_file: .env
+    environment:
+      - STORAGE_BACKEND=postgres
+      - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-notifications}@postgres:5432/notifications
+      - REDIS_URL=redis://redis:6379/0
+    command: ["python3", "-m", "app.migrate", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *app-base
+    ports:
+      - "8000:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import http.client;c=http.client.HTTPConnection('localhost',8000);c.request('GET','/health');r=c.getresponse();exit(0) if r.status==200 else exit(1)"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+
+  worker:
+    <<: *app-base
+    command: ["python3", "-m", "app.worker_runner", "whatsapp"]
+    # Scale independently: docker compose up --scale worker=3
+
+  worker_sms:
+    <<: *app-base
+    command: ["python3", "-m", "app.worker_runner", "sms"]
+
+  worker_email:
+    <<: *app-base
+    command: ["python3", "-m", "app.worker_runner", "email"]
+
+  worker_retry:
+    <<: *app-base
+    command: ["python3", "-m", "app.worker_runner", "--retry"]
+
+volumes:
+  pgdata:
+  redisdata:
+
+networks:
+  default:
+    driver: bridge

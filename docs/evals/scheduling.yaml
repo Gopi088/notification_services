@@ -1,0 +1,123 @@
+version: 1
+category: scheduling
+evals:
+  - eval_id: EVAL-SCHEDULING-001
+    version: 1
+    scenario: Send immediately (no send_at).
+    input: {send_at: null}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["status queued immediately", "not scheduled"]
+    evidence: [notification_state]
+    graders: ["notification.status == queued"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SCHEDULING-002
+    version: 1
+    scenario: Send at a future time.
+    input: {send_at: "2026-08-26T10:30:00+05:30", timezone: "Asia/Kolkata"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["status scheduled", "scheduled_at in future (UTC)", "not sent now"]
+    evidence: [notification_state, scheduled_at]
+    graders:
+      - "notification.status == scheduled"
+      - "scheduled_at > now"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SCHEDULING-003
+    version: 1
+    scenario: send_at in the past.
+    input: {send_at: "2020-01-01T00:00:00Z"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["status queued (send immediately)"]
+    evidence: [notification_state]
+    graders: ["notification.status == queued"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SCHEDULING-004
+    version: 1
+    scenario: Invalid timezone.
+    input: {send_at: "2026-08-26T10:30:00", timezone: "Not/AZone"}
+    preconditions: {}
+    expected_behavior: ["422 validation_error"]
+    evidence: [http_status]
+    graders: ["http_status == 422"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SCHEDULING-005
+    version: 1
+    scenario: Invalid send_at format.
+    input: {send_at: "not-a-date"}
+    preconditions: {}
+    expected_behavior: ["422 validation_error"]
+    evidence: [http_status]
+    graders: ["http_status == 422"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SCHEDULING-006
+    version: 1
+    scenario: UTC storage — naive local time converted via timezone.
+    input: {send_at: "2026-08-26T10:30:00", timezone: "Asia/Kolkata"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["scheduled_at stored in UTC (05:00Z)", "no timezone loss"]
+    evidence: [scheduled_at]
+    graders: ["scheduled_at == 2026-08-26T05:00:00Z"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-QUIET-HOURS-001
+    version: 1
+    scenario: Request at 23:30 during quiet hours (window 09:00-21:00).
+    input: {now: "23:30", window: "09:00-21:00"}
+    preconditions: {providers_mocked: true, quiet_hours_enabled: true}
+    expected_behavior:
+      - "NOT sent at 23:30"
+      - "scheduled for next allowed window (09:00 next day)"
+      - "user sees status scheduled"
+      - "audit record created"
+      - "logs explain deferral"
+    evidence: [notification_state, scheduled_at, audit_rows, logs]
+    graders:
+      - "notification.status == scheduled"
+      - "scheduled_at >= next 09:00"
+      - "audit contains notification_deferred"
+      - "log mentions quiet hours"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-QUIET-HOURS-002
+    version: 1
+    scenario: Request exactly at window start (09:00) is allowed.
+    input: {now: "09:00", window: "09:00-21:00"}
+    preconditions: {providers_mocked: true, quiet_hours_enabled: true}
+    expected_behavior: ["sent immediately (queued)"]
+    evidence: [notification_state]
+    graders: ["notification.status == queued"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-QUIET-HOURS-003
+    version: 1
+    scenario: Request one minute after window end (21:01) is deferred.
+    input: {now: "21:01", window: "09:00-21:00"}
+    preconditions: {providers_mocked: true, quiet_hours_enabled: true}
+    expected_behavior: ["deferred to next 09:00"]
+    evidence: [notification_state, scheduled_at]
+    graders: ["notification.status == scheduled", "scheduled_at >= next 09:00"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-QUIET-HOURS-004
+    version: 1
+    scenario: Midnight request is deferred.
+    input: {now: "00:00", window: "09:00-21:00"}
+    preconditions: {providers_mocked: true, quiet_hours_enabled: true}
+    expected_behavior: ["deferred to next 09:00"]
+    evidence: [notification_state]
+    graders: ["notification.status == scheduled"]
+    critical: false
+    pass_criteria: "all graders pass"

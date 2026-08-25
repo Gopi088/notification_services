@@ -17,7 +17,8 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.database import update_status_by_provider_id
+from app.audit import record_audit
+from app.storage import get_storage
 
 logger = logging.getLogger("webhooks")
 
@@ -27,6 +28,7 @@ router = APIRouter(prefix="/api/v1/whatsapp", tags=["whatsapp-webhook"])
 _SECRET_KEYS = frozenset({
     "authorization", "accesskey", "access_key", "secret", "password",
     "token", "connection_string", "connectionstring", "signingkey",
+    "api_key", "apikey",
 })
 
 
@@ -137,8 +139,20 @@ async def webhook_receive(request: Request):
         _log_event_safe(event)
 
         status_lower = status.lower()
+        storage = get_storage()
         if status_lower == "delivered":
-            update_status_by_provider_id(provider_message_id, status="delivered")
+            notif = storage.get_by_provider_message_id(provider_message_id)
+            if notif:
+                storage.transition(notif["id"], "delivered", actor="webhook")
+            storage.record_webhook_event(
+                provider="whatsapp", provider_message_id=provider_message_id,
+                status="delivered", payload=data,
+            )
+            record_audit(
+                user_id=notif.get("created_by") if notif else None,
+                action="notification_delivered", notification_id=notif["id"] if notif else None,
+                channel="whatsapp", status="delivered",
+            )
             logger.info(
                 "[WhatsApp Delivery Event] message_id=%s status=Delivered channel=whatsapp",
                 provider_message_id,
@@ -148,10 +162,22 @@ async def webhook_receive(request: Request):
             detail = error_message or error_code or "unknown failure (no error details in event)"
             if error_code:
                 detail = f"[{error_code}] {error_message}" if error_message else f"[{error_code}]"
-            update_status_by_provider_id(
-                provider_message_id,
-                status="failed",
-                error=f"WhatsApp delivery failed: {detail}",
+            notif = storage.get_by_provider_message_id(provider_message_id)
+            if notif:
+                storage.transition(
+                    notif["id"], "failed", actor="webhook",
+                    error=f"WhatsApp delivery failed: {detail}",
+                )
+            storage.record_webhook_event(
+                provider="whatsapp", provider_message_id=provider_message_id,
+                status="failed", error_code=error_code, error_message=error_message,
+                payload=data,
+            )
+            record_audit(
+                user_id=notif.get("created_by") if notif else None,
+                action="notification_failed", notification_id=notif["id"] if notif else None,
+                channel="whatsapp", status="failed", result="failure",
+                failure_reason=detail,
             )
             logger.warning(
                 "[WhatsApp Delivery Event] message_id=%s status=Failed channel=whatsapp "
@@ -159,12 +185,22 @@ async def webhook_receive(request: Request):
                 provider_message_id, error_code, error_message,
             )
         elif status_lower == "read":
-            update_status_by_provider_id(provider_message_id, status="delivered")
+            notif = storage.get_by_provider_message_id(provider_message_id)
+            if notif:
+                storage.transition(notif["id"], "delivered", actor="webhook")
+            storage.record_webhook_event(
+                provider="whatsapp", provider_message_id=provider_message_id,
+                status="read", payload=data,
+            )
             logger.info(
                 "[WhatsApp Delivery Event] message_id=%s status=Read channel=whatsapp",
                 provider_message_id,
             )
         else:
+            storage.record_webhook_event(
+                provider="whatsapp", provider_message_id=provider_message_id,
+                status=status, payload=data,
+            )
             logger.info(
                 "[WhatsApp Delivery Event] message_id=%s status=%s channel=whatsapp (unhandled)",
                 provider_message_id, status,

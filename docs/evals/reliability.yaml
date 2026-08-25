@@ -1,0 +1,74 @@
+version: 1
+category: reliability
+evals:
+  - eval_id: EVAL-RELIABILITY-001
+    version: 1
+    scenario: Provider unavailable; verify notification persisted, retry
+      scheduled with backoff, no infinite retry, eventually dead-lettered.
+    input:
+      channel: whatsapp
+      provider_behavior: fail_retryable
+      max_attempts: 3
+    preconditions: {providers_mocked: true, fail_mode: "retryable"}
+    expected_behavior:
+      - "notification persisted (queued)"
+      - "status transitions to retrying"
+      - "retries with exponential backoff"
+      - "no infinite retry (stops at max_attempts)"
+      - "final status dead_lettered"
+      - "audit records exist"
+      - "logs exist"
+    evidence: [notification_state_history, retry_count, audit_rows, logs, dlq_entries]
+    graders:
+      - "notification exists"
+      - "retry_count == max_attempts - 1"
+      - "final status == dead_lettered"
+      - "dlq entry exists"
+      - "audit contains notification_dead_lettered"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-RELIABILITY-002
+    version: 1
+    scenario: Queue publish fails after DB write; verify no silent loss.
+    input: {queue_behavior: fail_publish}
+    preconditions: {db_ready: true}
+    expected_behavior:
+      - "notification persisted"
+      - "publish failure handled (503 or reconciliation path)"
+      - "no silent loss (reconciliation can requeue)"
+    evidence: [notification_rows, http_status, reconciliation_evidence]
+    graders:
+      - "notification persisted"
+      - "no lost notification (reconcile finds queued rows)"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-RELIABILITY-003
+    version: 1
+    scenario: Worker crashes after provider accepts but before ACK; verify
+      redelivery does not double-send.
+    input: {worker_behavior: crash_after_send_before_ack}
+    preconditions: {providers_mocked: true}
+    expected_behavior:
+      - "message reclaimed (XAUTOCLAIM)"
+      - "redelivery detects already-submitted"
+      - "provider called once total"
+    evidence: [provider_call_count, notification_state, pending_messages]
+    graders:
+      - "provider_call_count == 1"
+      - "notification status == submitted"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-RELIABILITY-004
+    version: 1
+    scenario: Database becomes unavailable briefly; verify API degrades safely
+      and no data loss on recovery.
+    input: {db_behavior: unavailable_5s}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["API returns 503 while down", "recovers after", "no loss"]
+    evidence: [http_statuses, notification_rows]
+    graders: ["503 observed while down", "requests succeed after recovery"]
+    critical: false
+    pass_criteria: "all graders pass"

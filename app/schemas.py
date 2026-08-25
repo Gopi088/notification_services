@@ -20,9 +20,14 @@ class Channel(str, Enum):
 # public v1 enum above. Channels are validated at the API layer.
 class Status(str, Enum):
     queued = "queued"
+    processing = "processing"
+    submitted = "submitted"
+    retrying = "retrying"
     sent = "sent"
     delivered = "delivered"
     failed = "failed"
+    dead_lettered = "dead_lettered"
+    cancelled = "cancelled"
     partial = "partial"
 
 

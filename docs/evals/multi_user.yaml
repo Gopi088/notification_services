@@ -1,0 +1,50 @@
+version: 1
+category: multi_user
+evals:
+  - eval_id: EVAL-MULTI-USER-001
+    version: 1
+    scenario: 10 different users send notifications concurrently; verify ownership.
+    input: {users: 10, requests: 10}
+    preconditions: {providers_mocked: true, auth_enabled: true}
+    expected_behavior:
+      - "all accepted"
+      - "each notification owned by the correct user"
+      - "no cross-user access"
+    evidence: [http_statuses, notification_rows, created_by]
+    graders:
+      - "count(accepted) == 10"
+      - "all created_by match sender"
+      - "no user can read another's notification (403)"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-MULTI-USER-002
+    version: 1
+    scenario: Two users send the same message text; verify two separate
+      notifications (not deduplicated across users).
+    input: {users: [usr_A, usr_B], identical_message: true}
+    preconditions: {providers_mocked: true, auth_enabled: true}
+    expected_behavior: ["2 notifications", "distinct owners", "each sent once"]
+    evidence: [notification_rows, created_by]
+    graders:
+      - "count(notifications) == 2"
+      - "owners are usr_A and usr_B"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-MULTI-USER-003
+    version: 1
+    scenario: Rate limits are per-user; one user's burst does not block another.
+    input: {user_limit: 5, users: 2, requests_per_user: 5}
+    preconditions: {rate_limits_enabled: true, per_user_limits: true}
+    expected_behavior:
+      - "each user allowed their own limit"
+      - "exceeding own limit → 429"
+      - "other user unaffected"
+    evidence: [http_statuses]
+    graders:
+      - "first 5 per user == 202"
+      - "6th per user == 429"
+      - "other user's sends unaffected"
+    critical: false
+    pass_criteria: "all graders pass"

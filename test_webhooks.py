@@ -126,130 +126,117 @@ def test_validation_event(client):
     assert data["validationResponse"] == "21A3267A-E3D1-4368-9CE4-1FAD126B9515"
 
 
+def _seed_notification_with_provider_id(message_id: str, provider_id: str, channel: str = "whatsapp"):
+    """Insert a notification into the storage layer and set its provider_message_id."""
+    import uuid
+
+    from app.storage import get_storage
+
+    storage = get_storage()
+    nid = storage.create_notification(
+        message_id=message_id, channel=channel, recipient="+919887270348",
+        message="test", status="submitted",
+    )
+    # Attach provider info directly (status stays submitted).
+    storage.set_provider_info(nid, "vonage_whatsapp", provider_id)
+    return nid
+
+
+def _cleanup_notification(message_id: str):
+    import sqlite3
+
+    from app.config import get_settings
+
+    backend = get_settings().STORAGE_BACKEND or "sqlite"
+    if backend == "sqlite":
+        conn = sqlite3.connect(get_settings().DATABASE_PATH)
+        conn.execute("DELETE FROM notifications WHERE message_id=?", (message_id,))
+        conn.commit()
+        conn.close()
+    else:
+        import psycopg2
+
+        from app.config import get_settings
+
+        conn = psycopg2.connect(get_settings().DATABASE_URL)
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM notifications WHERE message_id=%s", (message_id,))
+        conn.commit()
+        conn.close()
+
+
 def test_delivery_delivered(client):
     """Delivery status delivered updates the DB."""
-    from app.database import create_message, get_connection, get_message
+    from app.storage import get_storage
 
     provider_id = "f2d5ebe4-b592-41f7-a494-78d5cd8b68de"
-    create_message(
-        message_id="test-delivered-msg",
-        channel="whatsapp",
-        contact="+919887270348",
-        message="test",
-        status="sent",
-        reference=None,
-    )
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE messages SET provider_message_id=? WHERE message_id=?",
-            (provider_id, "test-delivered-msg"),
-        )
+    _seed_notification_with_provider_id("test-delivered-msg", provider_id)
 
     resp = client.post("/api/v1/whatsapp/webhook", json=DELIVERY_DELIVERED_EVENT)
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     assert resp.json() == {"status": "ok"}
 
-    row = get_message("test-delivered-msg")
+    storage = get_storage()
+    row = storage.get_by_provider_message_id(provider_id)
     assert row is not None
     assert row["status"] == "delivered", f"Expected delivered, got {row['status']}"
-
-    with get_connection() as conn:
-        conn.execute("DELETE FROM messages WHERE message_id=?", ("test-delivered-msg",))
+    _cleanup_notification("test-delivered-msg")
 
 
 def test_delivery_failed(client):
     """Delivery status failed updates the DB with the error reason."""
-    from app.database import create_message, get_connection, get_message
+    from app.storage import get_storage
 
     provider_id = "d42632d4-20c0-4c97-b68a-3b04e40d7056"
-    create_message(
-        message_id="test-failed-msg",
-        channel="whatsapp",
-        contact="+919887270348",
-        message="test",
-        status="sent",
-        reference=None,
-    )
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE messages SET provider_message_id=? WHERE message_id=?",
-            (provider_id, "test-failed-msg"),
-        )
+    _seed_notification_with_provider_id("test-failed-msg", provider_id)
 
     resp = client.post("/api/v1/whatsapp/webhook", json=DELIVERY_FAILED_EVENT)
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
     assert resp.json() == {"status": "ok"}
 
-    row = get_message("test-failed-msg")
+    storage = get_storage()
+    row = storage.get_by_provider_message_id(provider_id)
     assert row is not None
     assert row["status"] == "failed", f"Expected failed, got {row['status']}"
-    assert "not a WhatsApp user" in row["error"], f"Unexpected error: {row['error']}"
-
-    with get_connection() as conn:
-        conn.execute("DELETE FROM messages WHERE message_id=?", ("test-failed-msg",))
+    assert "not a WhatsApp user" in row["last_error"], f"Unexpected error: {row['last_error']}"
+    _cleanup_notification("test-failed-msg")
 
 
 def test_delivery_failed_error_code_level(client):
     """errorCode/errorMessage at data level are extracted."""
-    from app.database import create_message, get_connection, get_message
+    from app.storage import get_storage
 
     provider_id = "9bd6356b-9c51-4d29-8f08-780e5b94a608"
-    create_message(
-        message_id="test-failed-code-msg",
-        channel="whatsapp",
-        contact="+919887270348",
-        message="test",
-        status="sent",
-        reference=None,
-    )
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE messages SET provider_message_id=? WHERE message_id=?",
-            (provider_id, "test-failed-code-msg"),
-        )
+    _seed_notification_with_provider_id("test-failed-code-msg", provider_id)
 
     resp = client.post("/api/v1/whatsapp/webhook", json=DELIVERY_FAILED_DATA_ERROR_LEVEL)
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
 
-    row = get_message("test-failed-code-msg")
+    storage = get_storage()
+    row = storage.get_by_provider_message_id(provider_id)
     assert row is not None
     assert row["status"] == "failed", f"Expected failed, got {row['status']}"
-    assert "80030" in row["error"], f"Expected error code in {row['error']}"
-    assert "could not be delivered" in row["error"], f"Unexpected error: {row['error']}"
-
-    with get_connection() as conn:
-        conn.execute("DELETE FROM messages WHERE message_id=?", ("test-failed-code-msg",))
+    assert "80030" in row["last_error"], f"Expected error code in {row['last_error']}"
+    assert "could not be delivered" in row["last_error"], f"Unexpected error: {row['last_error']}"
+    _cleanup_notification("test-failed-code-msg")
 
 
 def test_delivery_failed_details_array(client):
     """error.details array message is extracted when error.message is empty."""
-    from app.database import create_message, get_connection, get_message
+    from app.storage import get_storage
 
     provider_id = "efd82349-3b62-4913-9bcd-c0d5c20e5c5e"
-    create_message(
-        message_id="test-failed-details-msg",
-        channel="whatsapp",
-        contact="+919887270348",
-        message="test",
-        status="sent",
-        reference=None,
-    )
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE messages SET provider_message_id=? WHERE message_id=?",
-            (provider_id, "test-failed-details-msg"),
-        )
+    _seed_notification_with_provider_id("test-failed-details-msg", provider_id)
 
     resp = client.post("/api/v1/whatsapp/webhook", json=DELIVERY_FAILED_DETAILS_ARRAY)
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
 
-    row = get_message("test-failed-details-msg")
+    storage = get_storage()
+    row = storage.get_by_provider_message_id(provider_id)
     assert row is not None
     assert row["status"] == "failed", f"Expected failed, got {row['status']}"
-    assert "24 hours" in row["error"], f"Expected details message in {row['error']}"
-
-    with get_connection() as conn:
-        conn.execute("DELETE FROM messages WHERE message_id=?", ("test-failed-details-msg",))
+    assert "24 hours" in row["last_error"], f"Expected details message in {row['last_error']}"
+    _cleanup_notification("test-failed-details-msg")
 
 
 def test_extract_failure_helper(client=None):

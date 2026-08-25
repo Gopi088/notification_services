@@ -1,0 +1,59 @@
+version: 1
+category: performance
+evals:
+  - eval_id: EVAL-PERFORMANCE-001
+    version: 1
+    scenario: API latency baseline — 100 sequential sends (mocked provider).
+    input: {requests: 100, concurrent: 1}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["all 202", "P95 API latency recorded"]
+    evidence: [http_statuses, latency_histogram]
+    graders:
+      - "all http_status == 202"
+      - "P95 latency below baseline threshold (recorded, not invented)"
+    critical: false
+    pass_criteria: "all accepted; latency recorded"
+
+  - eval_id: EVAL-PERFORMANCE-002
+    version: 1
+    scenario: API latency at 100 concurrent requests.
+    input: {requests: 100, concurrent: 100}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["all accepted", "P95 latency recorded"]
+    evidence: [http_statuses, latency_histogram]
+    graders: ["all http_status == 202", "latency recorded"]
+    critical: false
+    pass_criteria: "all accepted; latency recorded"
+
+  - eval_id: EVAL-PERFORMANCE-003
+    version: 1
+    scenario: Worker throughput — queue drained with 2 workers.
+    input: {messages: 200, workers: 2}
+    preconditions: {providers_mocked: true, queue_enabled: true}
+    expected_behavior: ["all 200 processed", "queue drained", "throughput recorded"]
+    evidence: [processed_count, queue_pending, throughput]
+    graders: ["processed == 200", "queue pending == 0"]
+    critical: false
+    pass_criteria: "all processed; throughput recorded"
+
+  - eval_id: EVAL-PERFORMANCE-004
+    version: 1
+    scenario: Provider latency recorded per send.
+    input: {trigger: "one send", provider_latency_ms: 120}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["latency_ms persisted in attempt row"]
+    evidence: [attempt_row]
+    graders: ["attempt.latency_ms > 0"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-PERFORMANCE-005
+    version: 1
+    scenario: Queue depth metric available and reflects backlog.
+    input: {trigger: "publish 50 messages without workers"}
+    preconditions: {queue_enabled: true}
+    expected_behavior: ["queue depth == 50"]
+    evidence: [queue_depth]
+    graders: ["queue_depth == 50"]
+    critical: false
+    pass_criteria: "all graders pass"

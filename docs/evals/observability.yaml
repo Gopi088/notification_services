@@ -1,0 +1,63 @@
+version: 1
+category: observability
+evals:
+  - eval_id: EVAL-OBSERVABILITY-001
+    version: 1
+    scenario: Health endpoints respond.
+    input: {endpoints: ["/health", "/api/v1/health/liveness", "/api/v1/health/readiness"]}
+    preconditions: {app_running: true}
+    expected_behavior: ["all return 200"]
+    evidence: [http_statuses]
+    graders: ["all http_status == 200"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-OBSERVABILITY-002
+    version: 1
+    scenario: Readiness reflects storage availability.
+    input: {db_down: true}
+    preconditions: {}
+    expected_behavior: ["readiness 503 when storage down", "ok when up"]
+    evidence: [http_status]
+    graders: ["503 observed when down", "200 after recovery"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-OBSERVABILITY-003
+    version: 1
+    scenario: A notification lifecycle is traceable via request_id/notification_id.
+    input: {trigger: "one send"}
+    preconditions: {providers_mocked: true}
+    expected_behavior:
+      - "request_id present in API + worker + queue + DB logs"
+      - "notification_id present in worker + provider logs"
+      - "events: created, published, consumed, sent"
+    evidence: [logs]
+    graders:
+      - "log lines share request_id"
+      - "notification_id appears in worker/provider logs"
+      - "events created/published/consumed/sent present"
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-OBSERVABILITY-004
+    version: 1
+    scenario: Audit records exist for a successful send.
+    input: {trigger: "one send"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["audit has notification_created, notification_sent"]
+    evidence: [audit_rows]
+    graders: ["audit contains notification_created", "audit contains notification_sent"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-OBSERVABILITY-005
+    version: 1
+    scenario: Log levels are used correctly (info not error for normal events).
+    input: {trigger: "successful send", collect: "log levels"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["normal lifecycle events logged at INFO, not ERROR"]
+    evidence: [logs]
+    graders: ["no ERROR for successful send", "INFO events present"]
+    critical: false
+    pass_criteria: "all graders pass"

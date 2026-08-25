@@ -1,0 +1,68 @@
+version: 1
+category: security
+evals:
+  - eval_id: EVAL-SECURITY-001
+    version: 1
+    scenario: No secret appears in API responses.
+    input: {trigger: "send with error", collect: "response body"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["no api secret", "no password", "no connection string in response"]
+    evidence: [response_body]
+    graders: ["response contains none of secret values"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SECURITY-002
+    version: 1
+    scenario: No secret appears in logs.
+    input: {trigger: "send, fail, retry", collect: "all logs"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["no api secret", "no token", "no password in logs"]
+    evidence: [logs]
+    graders: ["logs contain none of secret values"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SECURITY-003
+    version: 1
+    scenario: PII masking in logs — phone numbers and emails are masked.
+    input: {trigger: "send with phone+email", collect: "logs"}
+    preconditions: {providers_mocked: true}
+    expected_behavior: ["phone masked", "email masked"]
+    evidence: [logs]
+    graders: ["full phone not in logs", "full email not in logs"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SECURITY-004
+    version: 1
+    scenario: Environment variables used for secrets; no hardcoded secrets in code.
+    input: {scan: "source tree"}
+    preconditions: {}
+    expected_behavior: ["no real secrets in source", ".env gitignored"]
+    evidence: [source_scan, gitignore_check]
+    graders: ["no hardcoded secret values found", ".env in .gitignore"]
+    critical: true
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SECURITY-005
+    version: 1
+    scenario: Rate limit exceeded returns 429, not 500, and is logged/audited.
+    input: {trigger: "exceed limit"}
+    preconditions: {rate_limits_enabled: true}
+    expected_behavior: ["HTTP 429", "rate_limit_exceeded logged", "audited"]
+    evidence: [http_status, logs, audit_rows]
+    graders: ["http_status == 429", "log mentions rate limit", "audit contains rate_limit_exceeded"]
+    critical: false
+    pass_criteria: "all graders pass"
+
+  - eval_id: EVAL-SECURITY-006
+    version: 1
+    scenario: SQL injection-style contact strings rejected safely.
+    input: {contact: "'; DROP TABLE notifications;--"}
+    preconditions: {}
+    expected_behavior: ["validation error (400/422)", "no SQL executed", "table intact"]
+    evidence: [http_status, table_exists]
+    graders: ["http_status in (400, 422)", "notifications table exists"]
+    critical: true
+    pass_criteria: "all graders pass"
