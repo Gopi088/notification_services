@@ -500,8 +500,10 @@ class Storage:
                     (to_status, provider, provider_message_id, error, now, to_status, notification_id),
                 )
         self._insert_event(notification_id, current, to_status, actor, {"error": error})
+        group_ref = row.get("group_id") if row else None
         logger.info(
-            "notification status changed id=%s from=%s to=%s", notification_id, current, to_status
+            "notification status changed id=%s group_id=%s from=%s to=%s",
+            notification_id, group_ref, current, to_status,
         )
         return self.get_notification(notification_id)
 

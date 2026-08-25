@@ -49,7 +49,8 @@ def process_message(channel: str, payload: Dict) -> bool:
 
     notification = storage.get_notification(notification_id)
     if notification is None:
-        logger.error("worker notification not found id=%s (DLQ)", notification_id)
+        logger.error("worker notification not found id=%s group_id=%s (DLQ)",
+                     notification_id, payload.get("group_id"))
         q.publish_dlq(channel, notification_id, payload.get("group_id"),
                       payload.get("recipient", ""), attempt,
                       reason="notification_not_found", error_code="NOT_FOUND")
@@ -57,8 +58,8 @@ def process_message(channel: str, payload: Dict) -> bool:
 
     # Idempotency guard: if already terminal/submitted by a prior redelivery, skip.
     if notification["status"] in (SUBMITTED, "delivered"):
-        logger.warning("worker duplicate delivery skipped id=%s status=%s",
-                       notification_id, notification["status"])
+        logger.warning("worker duplicate delivery skipped id=%s group_id=%s status=%s",
+                       notification_id, notification.get("group_id"), notification["status"])
         record_audit(
             user_id=notification.get("created_by"),
             action="duplicate_notification_attempted", notification_id=notification_id,
@@ -69,7 +70,8 @@ def process_message(channel: str, payload: Dict) -> bool:
     # Optimistic guard: only 'queued' or 'retrying' may go to processing.
     current = notification["status"]
     if current not in ("queued", RETRYING):
-        logger.warning("worker skipping id=%s unexpected status=%s", notification_id, current)
+        logger.warning("worker skipping id=%s group_id=%s unexpected status=%s",
+                       notification_id, notification.get("group_id"), current)
         return True
 
     updated = storage.transition(
@@ -82,8 +84,8 @@ def process_message(channel: str, payload: Dict) -> bool:
     started = time.monotonic()
     try:
         provider = get_provider(__import__("app.schemas", fromlist=["Channel"]).Channel(channel))
-        logger.info("worker provider selected notification_id=%s provider=%s",
-                    notification_id, provider.name)
+        logger.info("worker provider selected notification_id=%s group_id=%s provider=%s",
+                    notification_id, notification.get("group_id"), provider.name)
 
         # Provider rate-limit guard (best-effort, fail-open).
         from app import ratelimit
@@ -131,8 +133,9 @@ def process_message(channel: str, payload: Dict) -> bool:
             duration_ms=duration_ms,
         )
         logger.info(
-            "worker sent notification_id=%s provider=%s provider_message_id=%s attempt=%d latency_ms=%d",
-            notification_id, result.provider_name, result.provider_message_id, attempt, duration_ms,
+            "worker sent notification_id=%s group_id=%s provider=%s provider_message_id=%s attempt=%d latency_ms=%d",
+            notification_id, notification.get("group_id"), result.provider_name,
+            result.provider_message_id, attempt, duration_ms,
         )
         record_audit(
             user_id=notification.get("created_by"),
@@ -154,8 +157,8 @@ def process_message(channel: str, payload: Dict) -> bool:
             retryable=retryable, duration_ms=duration_ms,
         )
         logger.error(
-            "worker provider failed notification_id=%s attempt=%d retryable=%s error_code=%s error=%s",
-            notification_id, attempt, retryable, error_code, error_msg,
+            "worker provider failed notification_id=%s group_id=%s attempt=%d retryable=%s error_code=%s error=%s",
+            notification_id, notification.get("group_id"), attempt, retryable, error_code, error_msg,
         )
 
         if retryable and attempt < notification.get("max_attempts", get_settings().MAX_ATTEMPTS):
@@ -165,8 +168,8 @@ def process_message(channel: str, payload: Dict) -> bool:
             q.publish_retry(channel, notification_id, notification.get("group_id"),
                             notification.get("recipient"), attempt + 1, scheduled)
             logger.warning(
-                "worker retry scheduled notification_id=%s attempt=%d delay_ms=%d",
-                notification_id, attempt + 1, delay,
+                "worker retry scheduled notification_id=%s group_id=%s attempt=%d delay_ms=%d",
+                notification_id, notification.get("group_id"), attempt + 1, delay,
             )
             record_audit(
                 user_id=notification.get("created_by"),
@@ -184,8 +187,9 @@ def process_message(channel: str, payload: Dict) -> bool:
                           reason="max_attempts" if retryable else "non_retryable",
                           error_code=error_code, error_message=error_msg)
             logger.error(
-                "worker dead-lettered notification_id=%s reason=%s",
-                notification_id, "max_attempts" if retryable else "non_retryable",
+                "worker dead-lettered notification_id=%s group_id=%s reason=%s",
+                notification_id, notification.get("group_id"),
+                "max_attempts" if retryable else "non_retryable",
             )
             record_audit(
                 user_id=notification.get("created_by"),

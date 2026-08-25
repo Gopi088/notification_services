@@ -207,6 +207,45 @@ def config_check() -> None:
 
 # ---------------------------------------------------------------- actions
 
+def _print_recent_logs(lines: int = 8, delay: float = 1.5,
+                        notification_id: str = "", group_id: str = "") -> None:
+    """Show the log lines for the notification that was just acted on.
+
+    The CLI auto-starts the API as a detached background process, so its
+    stdout is not attached to this terminal. Instead of printing the whole
+    tail (which mixes unrelated notifications), filter the durable app log
+    (logs/app.log) by the notification_id / group_id of this action so only
+    the relevant lifecycle lines appear.
+    """
+    app_log, _ = _log_paths()
+    time.sleep(delay)  # let the async worker flush its log lines
+    needles = [x for x in (notification_id, group_id) if x]
+    try:
+        with open(app_log, "r", encoding="utf-8", errors="replace") as fh:
+            all_lines = fh.readlines()
+    except FileNotFoundError:
+        print(f"  (no application log yet at {app_log})")
+        return
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (could not read app log: {exc})")
+        return
+
+    if needles:
+        matched = [ln for ln in all_lines if any(n in ln for n in needles)]
+    else:
+        matched = all_lines
+    matched = matched[-lines:]
+    if not matched:
+        print("  (no log lines matched this notification yet)")
+        return
+    print("  --- notification log ---")
+    for ln in matched:
+        ln = ln.rstrip("\n")
+        if ln.strip():
+            print(f"  {ln}")
+    print("  -------------------------")
+
+
 def do_send_entries(entries: list, message: str) -> None:
     """POST pre-built channel entries (each with its own channel/contact/template)."""
     payload = {"channels": entries, "message": message}
@@ -227,6 +266,8 @@ def do_send_entries(entries: list, message: str) -> None:
     print(f"Check status: python3 notification_service.py status {group_id}")
     if VERBOSE:
         print(json.dumps(body, indent=2))
+    first_id = body["channels"][0]["message_id"] if body.get("channels") else group_id
+    _print_recent_logs(notification_id=first_id, group_id=group_id)
 
 
 def do_send(channels: list, message: str, template: str = "", template_params: dict | None = None) -> None:
@@ -274,6 +315,8 @@ def do_send_template(number: str, template_name: str, template_params: dict | No
     print(f"Check status: python3 notification_service.py status {group_id}")
     if VERBOSE:
         print(json.dumps(body, indent=2))
+    first_id = body["channels"][0]["message_id"] if body.get("channels") else group_id
+    _print_recent_logs(notification_id=first_id, group_id=group_id)
 
 
 def do_send_event(event_file: str) -> None:
@@ -302,6 +345,8 @@ def do_send_event(event_file: str) -> None:
     print(f"Check status: python3 notification_service.py status {group_id}")
     if VERBOSE:
         print(json.dumps(body, indent=2))
+    first_id = body["channels"][0]["message_id"] if body.get("channels") else group_id
+    _print_recent_logs(notification_id=first_id, group_id=group_id)
 
 
 def do_status(message_id: str) -> None:

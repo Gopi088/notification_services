@@ -72,8 +72,8 @@ def publish(channel: str, notification_id: str, group_id: Optional[str],
         r = _client()
         entry_id = r.xadd(stream_name(channel), {"payload": body}, maxlen=100000, approximate=True)
         logger.info(
-            "queue publish channel=%s notification_id=%s entry=%s",
-            channel, notification_id, entry_id,
+            "queue publish channel=%s notification_id=%s group_id=%s entry=%s",
+            channel, notification_id, group_id, entry_id,
         )
         return entry_id
     except Exception as exc:  # noqa: BLE001
