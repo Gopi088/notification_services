@@ -1,0 +1,28 @@
+[run]
+# Measure the application package only. The interactive CLI
+# (notification_service.py) is a thin process entry point that runs standalone,
+# and the root test_*.py scripts are standalone runners -- neither is exercised
+# by the pytest suite, so counting them would under-report true coverage.
+source = app
+
+[report]
+# Enforce the project coverage gate: overall >= 90% (statements/lines).
+fail_under = 90
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    return NotImplemented
+
+[coverage:report]
+# Files that run standalone (CLI entry point + standalone test runners) are
+# not part of the pytest unit suite; omit them so `--cov=.` measures the same
+# application code as the default `--cov=app` gate.
+omit =
+    notification_service.py
+    test_*.py
+    conftest.py
+    tests/conftest.py

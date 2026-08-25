@@ -14,11 +14,14 @@ Notification Service CLI - run it like any Linux command.
   python3 notification_service.py -v status <message_id>
   python3 notification_service.py audit [--limit N] [--user <id>]
   python3 notification_service.py logs [-f]
+  python3 notification_service.py db-check
 
 The server is started automatically if it isn't running.
-Set NOTIFICATION_API_KEY=<key> when AUTH_ENABLED=true in .env.
+When AUTH_ENABLED=true in .env, the CLI uses the same AUTH_API_KEY setting
+for authentication (single source of truth). No separate key is needed.
 """
 import json
+import logging
 import os
 import re
 import subprocess
@@ -47,18 +50,46 @@ def _log_paths() -> tuple:
     except Exception:
         return LOG_FILE, ""
 VERBOSE = False
-API_KEY = os.environ.get("NOTIFICATION_API_KEY", "")
+
+
+def _auth_api_key() -> str:
+    """Load AUTH_API_KEY from the application settings (.env).
+
+    Single source of truth: AUTH_ENABLED gates authentication and AUTH_API_KEY
+    is the only key used by both the server (app/auth.py) and this CLI.
+    """
+    try:
+        from app.config import get_settings
+
+        get_settings.cache_clear()
+        return get_settings().AUTH_API_KEY or ""
+    except Exception:
+        return ""
+
+
+API_KEY = _auth_api_key()
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 # ---------------------------------------------------------------- helpers
 
+def _json_detail(exc):
+    """Best-effort parse of an HTTPError body."""
+    try:
+        return json.loads(exc.read().decode())
+    except Exception:
+        return {"detail": str(exc)}
+
+
 def http(method: str, path: str, payload: dict | None = None):
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
-    if API_KEY:
-        headers["X-API-Key"] = API_KEY
+    key = API_KEY
+    if _SERVER_REQUIRES_AUTH and not key:
+        key = _ensure_api_key()
+    if key:
+        headers["X-API-Key"] = key
     req = urllib.request.Request(
         BASE_URL + path,
         data=data,
@@ -69,18 +100,54 @@ def http(method: str, path: str, payload: dict | None = None):
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        try:
-            return exc.code, json.loads(exc.read().decode())
-        except Exception:
-            return exc.code, {"detail": str(exc)}
+        if exc.code == 401 and not API_KEY and _SERVER_REQUIRES_AUTH:
+            key = _ensure_api_key()
+            headers["X-API-Key"] = key
+            req2 = urllib.request.Request(
+                BASE_URL + path, data=data, headers=headers, method=method,
+            )
+            try:
+                with urllib.request.urlopen(req2, timeout=5) as resp:
+                    return resp.status, json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc2:
+                return exc2.code, _json_detail(exc2)
+        return exc.code, _json_detail(exc)
 
 
 def server_up() -> bool:
     try:
-        code, _ = http("GET", "/health")
-        return code == 200
+        code, body = http("GET", "/health")
+        if code != 200:
+            return False
+        global _SERVER_REQUIRES_AUTH
+        _SERVER_REQUIRES_AUTH = bool(body.get("auth_enabled", False))
+        return True
     except Exception:
         return False
+
+
+_SERVER_REQUIRES_AUTH = False
+
+
+def _ensure_api_key() -> str:
+    """Return AUTH_API_KEY (from .env) without prompting.
+
+    The CLI and server share the same settings, so when AUTH_API_KEY is
+    configured the key is already loaded and there is no need to prompt.
+    Only when auth is enabled and no key is configured (misconfiguration) do
+    we prompt as a last resort so the CLI still works.
+    """
+    global API_KEY
+    if API_KEY:
+        return API_KEY
+    if not _SERVER_REQUIRES_AUTH:
+        return ""
+    try:
+        API_KEY = input("API key: ").strip()
+    except EOFError:
+        print("No API key configured. Set AUTH_API_KEY in .env.")
+        sys.exit(1)
+    return API_KEY
 
 
 def kill_port_holder() -> None:
@@ -207,7 +274,7 @@ def config_check() -> None:
 
 # ---------------------------------------------------------------- actions
 
-def _print_recent_logs(lines: int = 8, delay: float = 1.5,
+def _print_recent_logs(lines: int = 8, delay: float = 3.0,
                         notification_id: str = "", group_id: str = "") -> None:
     """Show the log lines for the notification that was just acted on.
 
@@ -381,6 +448,8 @@ def do_status(message_id: str) -> None:
 
 def interactive() -> None:
     ensure_server()
+    if _SERVER_REQUIRES_AUTH:
+        _ensure_api_key()  # prompt for the API key up front
     config_check()
     print("Notification Service CLI")
     print("------------------------")
@@ -503,8 +572,50 @@ def main() -> None:
         do_audit(rest)
     elif cmd == "logs":
         do_logs()
+    elif cmd in ("db-check", "dbcheck"):
+        do_db_check()
     else:
         usage()
+        sys.exit(1)
+
+
+def do_db_check() -> None:
+    """Check the configured database connection without exposing credentials.
+
+    Reports: backend, engine, host, connectivity. Never prints DATABASE_URL.
+    """
+    try:
+        from app.config import get_settings
+        from app.storage import Storage
+
+        get_settings.cache_clear()
+        s = get_settings()
+        storage = Storage()
+        host = storage._safe_host()
+        backend = storage.backend
+        engine = getattr(s, "DATABASE_BACKEND", "postgres") or "postgres"
+        ca = getattr(s, "COCKROACHDB_CA_CERT_PATH", "") or ""
+        print(f"Database backend : {backend}")
+        print(f"Database engine  : {engine}")
+        print(f"Database host    : {host}")
+        if backend == "sqlite":
+            print(f"SQLite path      : {s.DATABASE_PATH}")
+            import os
+
+            print("Status           : OK" if os.path.exists(s.DATABASE_PATH)
+                  else "Status           : file not found yet")
+            return
+        if engine == "cockroachdb":
+            if not ca:
+                print("CA cert path     : NOT SET")
+                print("Status           : FAILED (COCKROACHDB_CA_CERT_PATH is required)")
+                sys.exit(1)
+            print(f"CA cert path     : {ca}")
+        storage.connect()
+        storage.close()
+        print("Status           : OK")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Status           : FAILED ({exc})")
         sys.exit(1)
 
 
@@ -571,19 +682,67 @@ def do_audit(rest: list) -> None:
         )
 
 
+def _log_level_filter(level: int) -> callable:
+    """Return a predicate(line)->bool matching the terminal level filter.
+
+    LOG_LEVEL=INFO shows ONLY INFO lines; DEBUG shows DEBUG+INFO; etc.
+    """
+    allowed = {
+        logging.DEBUG: {"DEBUG", "INFO"},
+        logging.INFO: {"INFO"},
+        logging.WARNING: {"WARNING", "ERROR"},
+        logging.ERROR: {"ERROR", "CRITICAL"},
+        logging.CRITICAL: {"CRITICAL"},
+    }.get(level, {"INFO"})
+
+    def _match(line: str) -> bool:
+        for tok in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
+            if f" {tok} " in line or line.startswith(tok + " "):
+                return tok in allowed
+        return False
+
+    return _match
+
+
 def do_logs() -> None:
-    """Show the application log file (the CLI server writes its logs here).
+    """Show the application log file filtered by LOG_LEVEL (default INFO-only).
 
     Usage:
-        python3 notification_service.py logs            # last 50 lines
-        python3 notification_service.py logs -f         # follow (tail -f)
+        python3 notification_service.py logs                 # last 50 lines, INFO only
+        python3 notification_service.py logs -f              # follow (tail -f)
+        python3 notification_service.py logs --level ERROR   # only ERROR+CRITICAL
+        python3 notification_service.py logs --all           # all levels
     """
+    import logging as _logging
+
     follow = "-f" in sys.argv or "--follow" in sys.argv
+    show_all = "--all" in sys.argv
+    # Priority: --level CLI flag > LOG_LEVEL from settings > defaults
+    if "--level" in sys.argv:
+        i = sys.argv.index("--level")
+        if i + 1 < len(sys.argv):
+            level_name = sys.argv[i + 1].upper()
+        else:
+            level_name = "INFO"
+    else:
+        try:
+            from app.config import get_settings
+
+            get_settings.cache_clear()
+            level_name = (get_settings().LOG_LEVEL or "INFO").upper()
+        except Exception:  # noqa: BLE001
+            level_name = "INFO"
+    try:
+        level = getattr(_logging, level_name, _logging.INFO)
+    except Exception:  # noqa: BLE001
+        level = _logging.INFO
+
     app_log, _ = _log_paths()
     if not os.path.exists(app_log):
         print(f"No application log yet at {app_log}. Start the server first.")
         return
-    print(f"Application log: {app_log}")
+    matcher = (lambda line: True) if show_all else _log_level_filter(level)
+    print(f"Application log: {app_log}  (level={level_name})")
     try:
         if follow:
             # stream new lines like tail -f
@@ -592,14 +751,16 @@ def do_logs() -> None:
                 while True:
                     line = fh.readline()
                     if line:
-                        print(line, end="")
+                        if matcher(line):
+                            print(line, end="")
                     else:
                         time.sleep(0.5)
         else:
             with open(app_log, "r", encoding="utf-8", errors="replace") as fh:
                 lines = fh.readlines()
             for line in lines[-50:]:
-                print(line, end="")
+                if matcher(line):
+                    print(line, end="")
     except KeyboardInterrupt:
         return
 

@@ -15,6 +15,7 @@ from app.logging_config import configure_logging
 from app.routers.notifications import router as legacy_router
 from app.routers.v1 import router as v1_router
 from app.routers.webhooks import router as webhook_router
+from app.routers.inbound import router as inbound_router
 from app.storage import get_storage
 
 configure_logging()
@@ -38,7 +39,7 @@ def on_startup() -> None:
     # Run migrations exactly once per startup. PostgreSQL migrations are
     # advisory-locked + idempotent, so concurrent containers (api + workers)
     # never race on CREATE TABLE (no pg_type_typname_nsp_index errors).
-    if settings.STORAGE_BACKEND == "postgres":
+    if settings.STORAGE_BACKEND in ("postgres", "cockroachdb"):
         from app.migrate import up as run_migrations
 
         n = run_migrations()
@@ -63,8 +64,39 @@ def on_shutdown() -> None:
 
 @app.exception_handler(Exception)
 def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Map typed application errors to their HTTP status + uniform envelope;
+    anything else becomes a generic 500 internal_error (no secrets leaked)."""
+    from app.errors import AppError, classify_provider_error
+
+    if isinstance(exc, AppError):
+        logger.warning(
+            "request error path=%s code=%s message=%s",
+            request.url.path, exc.code, exc.message,
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"success": False, "error": exc.to_dict()},
+        )
+
+    # Provider exceptions raised outside the worker (e.g. synchronous path)
+    # are classified into typed errors.
+    classified = classify_provider_error(exc)
+    if isinstance(classified, AppError) and classified.code != "internal_error":
+        logger.warning(
+            "request provider error path=%s code=%s message=%s",
+            request.url.path, classified.code, classified.message,
+        )
+        return JSONResponse(
+            status_code=classified.status_code,
+            content={"success": False, "error": classified.to_dict()},
+        )
+
     logger.exception("unhandled error on %s", request.url.path)
-    return JSONResponse(status_code=500, content={"detail": "Internal server error."})
+    return JSONResponse(
+        status_code=500,
+        content={"success": False, "error": {"code": "internal_error",
+                                             "message": "Internal server error."}},
+    )
 
 
 # Versioned public API (recommended)
@@ -77,10 +109,15 @@ app.include_router(legacy_router)
 # Delivery-receipt webhook (Azure Event Grid)
 app.include_router(webhook_router)
 
+# Inbound (reply) webhook - recipients replying to notifications
+app.include_router(inbound_router)
+
 
 @app.get("/health", summary="Liveness: process is up")
 def health() -> dict:
-    return {"status": "ok", "mock_mode": settings.MOCK_MODE, "version": __version__}
+    s = get_settings()
+    return {"status": "ok", "mock_mode": s.MOCK_MODE, "version": __version__,
+            "auth_enabled": s.AUTH_ENABLED}
 
 
 @app.get("/api/v1/health/liveness", summary="Liveness check")
@@ -103,7 +140,7 @@ def readiness() -> JSONResponse:
 
         # Probe storage by checking if a simple query works (connectivity check).
         s = get_storage()
-        if s.backend == "postgres":
+        if s.backend in ("postgres", "cockroachdb"):
             with s._pg() as conn, conn.cursor() as cur:
                 cur.execute("SELECT 1")
         else:

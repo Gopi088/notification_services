@@ -131,3 +131,217 @@ def test_debug_mode_shows_debug(caplog):
     with caplog.at_level(logging.DEBUG):
         logger.debug("debug line visible")
     assert "debug line visible" in caplog.text
+
+
+def test_terminal_level_filter_info_only():
+    """LOG_LEVEL=INFO shows only INFO records (DEBUG/WARNING/ERROR/CRITICAL hidden)."""
+    import io
+    import logging
+
+    from app.logging_config import TerminalLevelFilter
+
+    captured = io.StringIO()
+    handler = logging.StreamHandler(captured)
+    handler.addFilter(TerminalLevelFilter(logging.INFO))
+    logger = logging.getLogger("filter-info-test")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    logger.debug("hidden debug")
+    logger.info("visible info")
+    logger.warning("hidden warning")
+    logger.error("hidden error")
+    logger.critical("hidden critical")
+
+    out = captured.getvalue()
+    assert "visible info" in out
+    assert "hidden debug" not in out
+    assert "hidden warning" not in out
+    assert "hidden error" not in out
+    assert "hidden critical" not in out
+
+
+def test_terminal_level_filter_debug_shows_debug_and_info():
+    """LOG_LEVEL=DEBUG shows DEBUG and INFO."""
+    import io
+    import logging
+
+    from app.logging_config import TerminalLevelFilter
+
+    captured = io.StringIO()
+    handler = logging.StreamHandler(captured)
+    handler.addFilter(TerminalLevelFilter(logging.DEBUG))
+    logger = logging.getLogger("filter-debug-test")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    logger.debug("debug shown")
+    logger.info("info shown")
+    logger.warning("hidden warning")
+    logger.error("hidden error")
+
+    out = captured.getvalue()
+    assert "debug shown" in out
+    assert "info shown" in out
+    assert "hidden warning" not in out
+    assert "hidden error" not in out
+
+
+def test_terminal_level_filter_warning_shows_warning_and_error():
+    """LOG_LEVEL=WARNING shows WARNING and ERROR (and hides DEBUG/INFO/CRITICAL)."""
+    import io
+    import logging
+
+    from app.logging_config import TerminalLevelFilter
+
+    captured = io.StringIO()
+    handler = logging.StreamHandler(captured)
+    handler.addFilter(TerminalLevelFilter(logging.WARNING))
+    logger = logging.getLogger("filter-warning-test")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    logger.info("hidden info")
+    logger.warning("warning shown")
+    logger.error("error shown")
+    logger.critical("hidden critical")
+
+    out = captured.getvalue()
+    assert "warning shown" in out
+    assert "error shown" in out
+    assert "hidden info" not in out
+    assert "hidden critical" not in out
+
+
+def test_terminal_level_filter_error_shows_error_and_critical():
+    import io
+    import logging
+
+    from app.logging_config import TerminalLevelFilter
+
+    captured = io.StringIO()
+    handler = logging.StreamHandler(captured)
+    handler.addFilter(TerminalLevelFilter(logging.ERROR))
+    logger = logging.getLogger("filter-error-test")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    logger.info("hidden info")
+    logger.error("error shown")
+    logger.critical("critical shown")
+
+    out = captured.getvalue()
+    assert "error shown" in out
+    assert "critical shown" in out
+    assert "hidden info" not in out
+
+
+def test_terminal_level_filter_critical_only():
+    import io
+    import logging
+
+    from app.logging_config import TerminalLevelFilter
+
+    captured = io.StringIO()
+    handler = logging.StreamHandler(captured)
+    handler.addFilter(TerminalLevelFilter(logging.CRITICAL))
+    logger = logging.getLogger("filter-critical-test")
+    logger.handlers = [handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+
+    logger.warning("hidden warning")
+    logger.critical("critical shown")
+
+    out = captured.getvalue()
+    assert "critical shown" in out
+    assert "hidden warning" not in out
+
+
+def test_configure_logging_attaches_terminal_filter(monkeypatch):
+    """configure_logging puts the exact-level filter on the stdout handler."""
+    import os
+
+    os.environ["LOG_LEVEL"] = "INFO"
+    os.environ["LOG_FORMAT"] = "text"
+    os.environ["LOG_FILE"] = ""
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.logging_config import configure_logging, TerminalLevelFilter
+
+    configure_logging()
+    root = logging.getLogger()
+    stdout_handler = next(
+        (h for h in root.handlers if isinstance(h, logging.StreamHandler)
+         and getattr(h, "baseFilename", "") == ""), None
+    )
+    assert stdout_handler is not None
+    filters = stdout_handler.filters
+    assert any(isinstance(f, TerminalLevelFilter) for f in filters)
+    get_settings.cache_clear()
+    logging.getLogger().handlers = []
+
+
+def test_file_handler_not_filtered(monkeypatch, tmp_path):
+    """The file handler keeps standard threshold semantics (no exact filter)."""
+    import os
+
+    logf = str(tmp_path / "app.log")
+    os.environ["LOG_LEVEL"] = "INFO"
+    os.environ["LOG_FORMAT"] = "text"
+    os.environ["LOG_FILE"] = logf
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.logging_config import configure_logging
+
+    configure_logging()
+    root = logging.getLogger()
+    file_handler = next(
+        (h for h in root.handlers if isinstance(h, logging.handlers.RotatingFileHandler)), None
+    )
+    assert file_handler is not None
+    # File handler must NOT have the terminal's exact-level filter.
+    assert not file_handler.filters
+
+    # A WARNING written through the file handler is persisted.
+    logger = logging.getLogger("file-level-test")
+    logger.warning("warning persists to file")
+    logger.handlers = [file_handler]
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    logger.warning("warning should be in file")
+    file_handler.flush()
+    content = open(logf).read()
+    assert "warning should be in file" in content
+
+    for h in root.handlers:
+        try:
+            h.close()
+        except Exception:
+            pass
+    logging.getLogger().handlers = []
+    get_settings.cache_clear()
+
+
+def test_log_level_filter_predicate():
+    """_log_level_filter(INFO) matches only INFO lines."""
+    from notification_service import _log_level_filter
+    import logging as _l
+
+    match = _log_level_filter(_l.INFO)
+    assert match("2026-01-01 INFO app: startup")
+    assert not match("2026-01-01 ERROR app: boom")
+    assert not match("2026-01-01 WARNING app: warn")
+    assert not match("2026-01-01 DEBUG app: dbg")
+    assert not match("2026-01-01 CRITICAL app: crit")
+
+    match_error = _log_level_filter(_l.ERROR)
+    assert match_error("2026-01-01 ERROR app: boom")
+    assert match_error("2026-01-01 CRITICAL app: crit")
+    assert not match_error("2026-01-01 INFO app: ok")

@@ -157,3 +157,19 @@ MOCK_MODE).
 - `notifications`: retain indefinitely or per compliance policy (default 365 days for active, then cold storage).
 - `webhook_events`: retain 30 days for reconciliation.
 - Retention implemented as scheduled batch delete, never in the request path.
+## 3.8 CockroachDB Support
+
+The data model is PG-wire-compatible and runs unchanged on **CockroachDB Cloud**
+(same `psycopg2` driver, same SQL). Configuration:
+
+- `STORAGE_BACKEND=postgres`
+- `DATABASE_BACKEND=cockroachdb`
+- `DATABASE_URL=postgresql://USER:PASSWORD@HOST:26257/DB?sslmode=verify-full`
+- `COCKROACH_CA_CERT=/path/to/ca.crt` (required for `sslmode=verify-full`)
+
+Connections use TLS with `sslmode=verify-full` and verify the server certificate
+against `COCKROACH_CA_CERT`. The DSN and password are read only from the
+environment and never logged (only the host is logged). Migrations remain
+advisory-locked + idempotent, so API/worker containers never race on schema
+creation. See `python3 notification_service.py db-check` for a safe connection
+test that never prints credentials.

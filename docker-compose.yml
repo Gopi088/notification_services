@@ -9,6 +9,11 @@ x-app-base: &app-base
   environment:
     - MOCK_MODE=${MOCK_MODE:-false}
     - STORAGE_BACKEND=${STORAGE_BACKEND:-postgres}
+    # Local Docker PostgreSQL uses the "postgres" engine (NOT cockroachdb).
+    # DATABASE_BACKEND/COCKROACHDB_CA_CERT_PATH from .env would otherwise force
+    # TLS (verify-full) against a server that doesn't support SSL.
+    - DATABASE_BACKEND=postgres
+    - COCKROACHDB_CA_CERT_PATH=
     - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-notifications}@postgres:5432/notifications
     - REDIS_URL=redis://redis:6379/0
     - QUEUE_ENABLED=${QUEUE_ENABLED:-true}
@@ -60,6 +65,8 @@ services:
     env_file: .env
     environment:
       - STORAGE_BACKEND=postgres
+      - DATABASE_BACKEND=postgres
+      - COCKROACHDB_CA_CERT_PATH=
       - DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD:-notifications}@postgres:5432/notifications
       - REDIS_URL=redis://redis:6379/0
     command: ["python3", "-m", "app.migrate", "up"]

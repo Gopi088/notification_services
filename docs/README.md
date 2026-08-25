@@ -60,6 +60,7 @@ Redis (supporting, never the source of truth)
 | 25 | [25-REDIS-DESIGN.md](25-REDIS-DESIGN.md) | Redis responsibilities: rate limiting, idempotency cache, queues |
 | 26 | [26-AUTH-AUDIT-DESIGN.md](26-AUTH-AUDIT-DESIGN.md) | Full authentication, authorization, audit design (detailed) |
 | 27 | [27-TEST-PLAN.md](27-TEST-PLAN.md) | Detailed test-case matrix (TC-001..TC-150) |
+| 28 | [28-MESSAGE-ROUTING-TEMPLATES-ERRORS.md](28-MESSAGE-ROUTING-TEMPLATES-ERRORS.md) | Error handling, external templates, message routing, inbound replies |
 | — | [BASELINE.md](BASELINE.md) | Pre-redesign baseline: architecture, test status, coverage |
 | — | [00-README-PROJECT.md](00-README-PROJECT.md) | Original project README (preserved) |
 

@@ -76,3 +76,26 @@ def render_email(
 def render_sms(message: str) -> str:
     """SMS has no formatting; return the message unchanged."""
     return message
+
+
+def render_sms_template(
+    message: str,
+    template_name: str,
+    params: Optional[Dict[str, str]] = None,
+) -> str:
+    """
+    Render an SMS through a plain-text template from templates/sms/<name>.txt.
+
+    The template may contain {{body}} (the original message) and any number of
+    {{name}} placeholders filled from `params`. Missing templates fall back to
+    the plain message so SMS sends never break on a missing file.
+    """
+    values: Dict[str, str] = {
+        "body": message,
+        **( {str(k): str(v) for k, v in (params or {}).items()}),
+    }
+    path = _templates_dir() / "sms" / f"{Path(template_name).name}.txt"
+    if not path.is_file():
+        return message
+    raw = path.read_text(encoding="utf-8")
+    return _PLACEHOLDER_RE.sub(lambda m: values.get(m.group(1), ""), raw)

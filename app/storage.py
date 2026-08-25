@@ -132,6 +132,17 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs (user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_notif ON audit_logs (notification_id);
+
+CREATE TABLE IF NOT EXISTS inbound_messages (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel              TEXT,
+    from_number          TEXT,
+    to_number            TEXT,
+    text                 TEXT,
+    provider_message_id  TEXT,
+    raw                  TEXT,
+    created_at           TEXT NOT NULL
+);
 """
 
 PG_SCHEMA = """
@@ -231,6 +242,17 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs (user_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_notif ON audit_logs (notification_id);
+
+CREATE TABLE IF NOT EXISTS inbound_messages (
+    id                   BIGSERIAL PRIMARY KEY,
+    channel              TEXT,
+    from_number          TEXT,
+    to_number            TEXT,
+    text                 TEXT,
+    provider_message_id  TEXT,
+    raw                  JSONB,
+    created_at           TIMESTAMPTZ NOT NULL
+);
 """
 
 
@@ -239,41 +261,77 @@ def _now() -> str:
 
 
 class Storage:
-    """Unified storage interface over SQLite or PostgreSQL."""
+    """Unified storage interface over SQLite, PostgreSQL or CockroachDB."""
 
-    def __init__(self, backend: Optional[str] = None, url: Optional[str] = None):
+    def __init__(self, backend: Optional[str] = None, url: Optional[str] = None,
+                 db_backend: Optional[str] = None, ca_cert: Optional[str] = None):
         settings = get_settings()
         self.backend = (backend or settings.STORAGE_BACKEND or "sqlite").lower()
         self._url = url or settings.DATABASE_URL
         self._sqlite_path = settings.DATABASE_PATH
+        self.db_backend = (db_backend or settings.DATABASE_BACKEND or "postgres").lower()
+        self._ca_cert = ca_cert or settings.COCKROACHDB_CA_CERT_PATH or ""
         self._conn = None
         self._pg_conn = None
 
     # ---- connection management ----
     def connect(self) -> None:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             import psycopg2
             from psycopg2 import pool
 
             if not self._url:
                 raise RuntimeError("DATABASE_URL is required when STORAGE_BACKEND=postgres")
-            self._pg_pool = pool.ThreadedConnectionPool(
-                get_settings().DB_POOL_MIN, get_settings().DB_POOL_MAX, self._url
+            kwargs = {
+                "minconn": get_settings().DB_POOL_MIN,
+                "maxconn": get_settings().DB_POOL_MAX,
+                "dsn": self._url,
+            }
+            # CockroachDB Cloud: verify the server cert against the CA and use
+            # TLS. The URL already carries sslmode=verify-full; add the CA cert
+            # if provided via COCKROACHDB_CA_CERT_PATH. Never log the DSN/password.
+            if self.db_backend == "cockroachdb":
+                if "sslmode" not in self._url and "sslmode=" not in self._url:
+                    kwargs["sslmode"] = "verify-full"
+                if self._ca_cert:
+                    kwargs["sslrootcert"] = self._ca_cert
+            try:
+                self._pg_pool = pool.ThreadedConnectionPool(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("database connection failed backend=%s engine=%s: %s",
+                             self.backend, self.db_backend, exc)
+                raise
+            host = self._safe_host()
+            logger.info(
+                "database connected backend=%s engine=%s host=%s",
+                self.backend, self.db_backend, host,
             )
-            logger.info("storage connected (postgres)")
         else:
             self._conn = sqlite3.connect(self._sqlite_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             logger.info("storage connected (sqlite: %s)", self._sqlite_path)
 
+    def _safe_host(self) -> str:
+        """Return host[:port] from the DSN without exposing user/password."""
+        try:
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self._url)
+            netloc = parsed.netloc
+            if "@" in netloc:
+                netloc = netloc.split("@")[-1]
+            return netloc or "unknown"
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
     def init_schema(self) -> None:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(PG_SCHEMA)
         else:
             with self._sqlite() as conn:
                 conn.executescript(SQLITE_SCHEMA)
-        logger.info("storage schema ready (%s)", self.backend)
+        logger.info("storage schema ready (%s/%s)", self.backend, self.db_backend)
 
     def close(self) -> None:
         if getattr(self, "_pg_pool", None) is not None:
@@ -359,7 +417,7 @@ class Storage:
             import json
             params_json = json.dumps(template_params)
         max_a = max_attempts if max_attempts is not None else get_settings().MAX_ATTEMPTS
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             import json as _json
 
             with self._pg() as conn, conn.cursor() as cur:
@@ -393,7 +451,7 @@ class Storage:
         return nid
 
     def get_notification(self, notification_id: str) -> Optional[Dict]:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             safe = self._pg_uuid_safe(notification_id)
             if safe is None:
                 return None
@@ -409,7 +467,7 @@ class Storage:
         return self._row_to_dict(row)
 
     def get_notification_by_message_id(self, message_id: str) -> Optional[Dict]:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             safe = self._pg_uuid_safe(message_id)
             if safe is None:
                 return None
@@ -425,7 +483,7 @@ class Storage:
         return self._row_to_dict(row)
 
     def get_by_provider_message_id(self, provider_message_id: str) -> Optional[Dict]:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     "SELECT * FROM notifications WHERE provider_message_id = %s",
@@ -442,7 +500,7 @@ class Storage:
         return self._row_to_dict(row)
 
     def get_group(self, group_id: str) -> List[Dict]:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             safe = self._pg_uuid_safe(group_id)
             if safe is None:
                 return []
@@ -459,7 +517,7 @@ class Storage:
                     (group_id,),
                 ).fetchall()
         cols = [d[0] for d in getattr(rows, "description", [])] if rows else []
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             return [dict(zip(cols, r)) for r in rows]
         return [dict(r) for r in rows]
 
@@ -479,7 +537,7 @@ class Storage:
             )
             return row
         now = _now()
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """UPDATE notifications SET status=%s, provider=COALESCE(%s, provider),
@@ -511,7 +569,7 @@ class Storage:
         """Attach provider + provider_message_id to a notification (used by webhook
         reconciliation and tests) without changing its status."""
         now = _now()
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """UPDATE notifications SET provider=%s, provider_message_id=%s, updated_at=%s
@@ -531,7 +589,7 @@ class Storage:
         now = _now()
         import json
         detail_json = json.dumps(detail) if detail else None
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO notification_events
@@ -553,7 +611,7 @@ class Storage:
                     error_code: Optional[str] = None, error_message: Optional[str] = None,
                     retryable: Optional[bool] = None, duration_ms: Optional[int] = None) -> None:
         now = _now()
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO notification_attempts
@@ -576,7 +634,7 @@ class Storage:
                 )
 
     def list_attempts(self, notification_id: str) -> List[Dict]:
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     "SELECT * FROM notification_attempts WHERE notification_id=%s ORDER BY attempt",
@@ -595,7 +653,7 @@ class Storage:
 
     def find_idempotency_key_row(self, key: str) -> Optional[Dict]:
         """Return the raw idempotency_keys row for a key (durable dedup)."""
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute("SELECT * FROM idempotency_keys WHERE key=%s", (key,))
                 row = cur.fetchone()
@@ -623,7 +681,7 @@ class Storage:
             + _dt.timedelta(seconds=get_settings().IDEMPOTENCY_TTL_SECONDS)
         ).isoformat()
         try:
-            if self.backend == "postgres":
+            if self.backend in ("postgres", "cockroachdb"):
                 with self._pg() as conn, conn.cursor() as cur:
                     cur.execute(
                         """INSERT INTO idempotency_keys (key, notification_id, payload_hash, created_at, expires_at)
@@ -645,7 +703,7 @@ class Storage:
     def due_notifications(self, limit: int = 100) -> List[Dict]:
         """Rows queued/retrying whose next_attempt_at has passed (reconciliation)."""
         now = _now()
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """SELECT * FROM notifications
@@ -675,7 +733,7 @@ class Storage:
         now = _now()
         import json
         payload_json = json.dumps(payload) if payload else None
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO webhook_events
@@ -707,7 +765,7 @@ class Storage:
         audit_id = f"AUD_{_uuid.uuid4().hex[:12]}"
         now = _now()
         meta_json = json.dumps(metadata) if metadata else None
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO audit_logs
@@ -749,7 +807,7 @@ class Storage:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY id DESC LIMIT ?"
         params.append(limit)
-        if self.backend == "postgres":
+        if self.backend in ("postgres", "cockroachdb"):
             q = sql.replace("?", "%s")
             with self._pg() as conn, conn.cursor() as cur:
                 cur.execute(q, params)
@@ -759,6 +817,52 @@ class Storage:
         else:
             with self._sqlite() as conn:
                 rows = conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
+
+    def record_inbound_message(self, *, channel: str, from_number: str,
+                               to_number: str, text: str,
+                               provider_message_id: Optional[str] = None,
+                               raw: Optional[Dict] = None) -> int:
+        """Persist an inbound (reply) message. Returns the row id."""
+        import json
+
+        now = _now()
+        raw_json = json.dumps(raw) if raw else None
+        if self.backend in ("postgres", "cockroachdb"):
+            with self._pg() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO inbound_messages
+                       (channel, from_number, to_number, text, provider_message_id, raw, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                    (channel, from_number, to_number, text, provider_message_id, raw_json, now),
+                )
+                row = cur.fetchone()
+                return row[0]
+        else:
+            with self._sqlite() as conn:
+                cur = conn.execute(
+                    """INSERT INTO inbound_messages
+                       (channel, from_number, to_number, text, provider_message_id, raw, created_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (channel, from_number, to_number, text, provider_message_id, raw_json, now),
+                )
+                return cur.lastrowid
+
+    def list_inbound(self, limit: int = 50) -> List[Dict]:
+        """Return the most recent inbound messages."""
+        if self.backend in ("postgres", "cockroachdb"):
+            with self._pg() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM inbound_messages ORDER BY id DESC LIMIT %s", (limit,)
+                )
+                rows = cur.fetchall()
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, r)) for r in rows]
+        else:
+            with self._sqlite() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM inbound_messages ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
                 return [dict(r) for r in rows]
 
 
@@ -773,7 +877,7 @@ def get_storage() -> Storage:
         # SQLite is single-process / dev: safe to auto-init schema.
         # PostgreSQL schema is created by app/migrate.py (advisory-locked, idempotent)
         # to avoid the pg_type_typname_nsp_index race from concurrent containers.
-        if _storage.backend != "postgres":
+        if _storage.backend not in ("postgres", "cockroachdb"):
             _storage.init_schema()
     return _storage
 

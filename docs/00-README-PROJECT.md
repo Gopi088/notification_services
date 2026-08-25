@@ -96,10 +96,10 @@ curl -H "X-API-Key: <your-secret>" http://127.0.0.1:8000/api/v1/health
 ```
 
 Wrong or missing keys get `401` with `{"success": false, "error": {"code": "unauthorized", ...}}`.
-CLI clients read the key from the `NOTIFICATION_API_KEY` environment variable:
+The CLI uses the same `AUTH_API_KEY` setting (single source of truth):
 
 ```bash
-export NOTIFICATION_API_KEY=<your-secret>
+# AUTH_API_KEY is read from .env by both the server and CLI
 ./cli.sh send email you@example.com "Hello"
 ```
 

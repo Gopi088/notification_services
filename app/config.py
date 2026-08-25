@@ -40,6 +40,14 @@ class Settings(BaseSettings):
     # PostgreSQL DSN (used when STORAGE_BACKEND=postgres).
     # Example: postgresql://user:pass@localhost:5432/notifications
     DATABASE_URL: str = ""
+    # PG-compatible database engine: "postgres" (default, incl. local Docker)
+    # or "cockroachdb" (CockroachDB Cloud, wire-compatible with PostgreSQL).
+    DATABASE_BACKEND: str = "postgres"
+    # Path to the CockroachDB CA certificate (CockroachDB Cloud). Used only
+    # when DATABASE_BACKEND=cockroachdb. With sslmode=verify-full the server
+    # certificate is verified against this CA. This is the canonical name;
+    # the DSN must never carry it (we pass it as sslrootcert to psycopg2).
+    COCKROACHDB_CA_CERT_PATH: str = ""
     DB_POOL_MIN: int = 1
     DB_POOL_MAX: int = 10
 
@@ -91,6 +99,11 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "text"  # "text" (dev) or "json" (structured)
     LOG_REDACT_KEYS: str = ""  # extra comma-separated field names to redact
+    # Optional independent file level (standard threshold semantics). When
+    # empty, the file handler uses LOG_LEVEL (but unlike the terminal, it does
+    # not apply the exact-level filter, so WARNING/ERROR are still written to
+    # the log file).
+    LOG_FILE_LEVEL: str = ""
     # Application log file (optional). When set, logs are also written to a
     # rotating file (in addition to stdout/stderr). Empty = stdout only.
     LOG_FILE: str = ""
@@ -99,6 +112,12 @@ class Settings(BaseSettings):
     # Audit log file (JSON lines) - separate from application logs. When set,
     # audit records are also appended here (durable even if DB is unavailable).
     AUDIT_LOG_FILE: str = ""
+    # Inbound (reply) handling.
+    # When true, an auto-reply is sent back to recipients who reply to a
+    # notification (2-way conversations). Set INBOUND_AUTO_REPLY_TEXT to the
+    # reply body.
+    INBOUND_AUTO_REPLY: bool = False
+    INBOUND_AUTO_REPLY_TEXT: str = ""
 
     # --- Vonage SMS (alternative SMS provider to Azure) ---
     # If VONAGE_API_KEY and VONAGE_API_SECRET are set, the SMS channel uses

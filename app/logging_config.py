@@ -27,7 +27,7 @@ from app.config import get_settings
 _SECRET_KEYS = frozenset({
     "authorization", "accesskey", "access_key", "secret", "password",
     "token", "connection_string", "connectionstring", "signingkey",
-    "api_key", "apikey", "auth",
+    "api_key", "apikey", "auth", "database_url", "dsn",
 })
 
 # Patterns for masking PII when fields look like phones/emails.
@@ -53,6 +53,41 @@ def _redact_pii(text: str) -> str:
     text = _PHONE_RE.sub(lambda m: mask(m.group(0)), text)
     text = _EMAIL_RE.sub(lambda m: mask(m.group(0)), text)
     return text
+
+
+class TerminalLevelFilter(logging.Filter):
+    """Exact-level filter for terminal output.
+
+    When LOG_LEVEL=INFO, only records with level exactly INFO are displayed
+    (DEBUG/WARNING/ERROR/CRITICAL are hidden). Other levels behave per the
+    documented mapping:
+
+      LOG_LEVEL=DEBUG    -> DEBUG + INFO
+      LOG_LEVEL=INFO     -> INFO only
+      LOG_LEVEL=WARNING  -> WARNING + ERROR
+      LOG_LEVEL=ERROR    -> ERROR + CRITICAL
+      LOG_LEVEL=CRITICAL -> CRITICAL
+
+    The file handler is intentionally NOT given this filter so file logging
+    stays independent (standard threshold semantics) and nothing is lost on
+    disk. Audit records are persisted separately (DB + audit file) and are
+    never affected by this filter.
+    """
+
+    _ALLOWED: dict = {
+        logging.DEBUG: {logging.DEBUG, logging.INFO},
+        logging.INFO: {logging.INFO},
+        logging.WARNING: {logging.WARNING, logging.ERROR},
+        logging.ERROR: {logging.ERROR, logging.CRITICAL},
+        logging.CRITICAL: {logging.CRITICAL},
+    }
+
+    def __init__(self, level: int):
+        super().__init__()
+        self.level = level
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno in self._ALLOWED.get(self.level, {record.levelno})
 
 
 class StructuredFormatter(logging.Formatter):
@@ -99,7 +134,13 @@ class PlainFormatter(logging.Formatter):
 
 
 def configure_logging() -> None:
-    """Configure root logger: stdout handler + optional rotating file handler."""
+    """Configure root logger: stdout handler + optional rotating file handler.
+
+    The stdout (terminal) handler applies the exact-level TerminalLevelFilter
+    so e.g. LOG_LEVEL=INFO shows ONLY INFO records. The file handler is kept
+    independent (standard threshold semantics) so WARNING/ERROR are still
+    recorded to disk even when the terminal filters them out.
+    """
     settings = get_settings()
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
     fmt = settings.LOG_FORMAT.lower()
@@ -109,11 +150,13 @@ def configure_logging() -> None:
     )
 
     root = logging.getLogger()
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)  # allow everything upstream; handlers filter
     root.handlers = []
 
+    # Terminal handler: exact-level filter applied here.
     stdout = logging.StreamHandler(sys.stdout)
     stdout.setFormatter(formatter)
+    stdout.addFilter(TerminalLevelFilter(level))
     root.addHandler(stdout)
 
     log_file = getattr(settings, "LOG_FILE", "") or ""
@@ -128,6 +171,13 @@ def configure_logging() -> None:
                 log_file, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
             )
             rotating.setFormatter(formatter)
+            # File handler keeps standard threshold semantics (independent of
+            # the terminal's exact-level filter).
+            file_level = getattr(settings, "LOG_FILE_LEVEL", "") or ""
+            if file_level:
+                rotating.setLevel(getattr(logging, file_level.upper(), level))
+            else:
+                rotating.setLevel(level)
             root.addHandler(rotating)
         except Exception:  # noqa: BLE001 - logging config must not crash startup
             pass

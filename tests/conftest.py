@@ -8,16 +8,23 @@ production data, or real Redis/PostgreSQL unless explicitly overridden.
 import os
 import tempfile
 
-os.environ.setdefault("MOCK_MODE", "true")
-os.environ.setdefault("STORAGE_BACKEND", "sqlite")
-os.environ.setdefault("QUEUE_ENABLED", "false")
-os.environ.setdefault("RATELIMIT_ENABLED", "false")
-os.environ.setdefault("REDIS_URL", "redis://localhost:6379/15")
-os.environ.setdefault("AUTH_ENABLED", "false")
-os.environ.setdefault("LOG_LEVEL", "ERROR")
+# Force the test environment so `.env` can never leak real CockroachDB
+# credentials / STORAGE_BACKEND into the pytest run. Direct assignment
+# (not setdefault) guarantees the suite always uses SQLite + local Postgres
+# unless an individual test overrides via monkeypatch.
+os.environ["MOCK_MODE"] = "true"
+os.environ["STORAGE_BACKEND"] = "sqlite"
+os.environ["DATABASE_BACKEND"] = "postgres"
+os.environ["DATABASE_URL"] = ""
+os.environ["COCKROACHDB_CA_CERT_PATH"] = ""
+os.environ["QUEUE_ENABLED"] = "false"
+os.environ["RATELIMIT_ENABLED"] = "false"
+os.environ["REDIS_URL"] = "redis://localhost:6379/15"
+os.environ["AUTH_ENABLED"] = "false"
+os.environ["LOG_LEVEL"] = "ERROR"
 
 _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-os.environ.setdefault("DATABASE_PATH", _tmp_db.name)
+os.environ["DATABASE_PATH"] = _tmp_db.name
 
 
 def pytest_configure(config):

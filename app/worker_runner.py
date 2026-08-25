@@ -28,7 +28,7 @@ def main() -> int:
 
     # Ensure schema is migrated before this worker starts consuming. Advisory
     # lock makes concurrent api/worker startups safe (idempotent, no race).
-    if get_settings().STORAGE_BACKEND == "postgres":
+    if get_settings().STORAGE_BACKEND in ("postgres", "cockroachdb"):
         from app.migrate import up as run_migrations
 
         run_migrations()

@@ -19,7 +19,7 @@ Vonage expects the `to` number WITHOUT the leading "+" (digits only, 7-15).
 """
 import logging
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import requests
 
@@ -88,9 +88,28 @@ class VonageSMSProvider(NotificationProvider):
         logger.info("[SMS] Vonage message ID: %s | Provider accepted message", message_id)
         return ProviderResult(self.name, message_id, "sent")
 
+    def send_with_template(
+        self,
+        contact: str,
+        message: str,
+        template_name: str,
+        template_language: Optional[str] = None,
+        template_params: Optional[Dict[str, str]] = None,
+    ) -> ProviderResult:
+        """Send SMS rendered through a local templates/sms/<name>.txt template."""
+        from app.message_format import format_sms
+
+        rendered = format_sms(message, template_name, template_params)
+        return self.send(contact, rendered)
+
     def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
         recipient = payload.get("recipient", "")
         message = payload.get("message") or (str(data) if isinstance(data, str) else "") or ""
+        template = payload.get("template")
+        if isinstance(template, dict) and template.get("name"):
+            params = {p["name"]: p["value"] for p in (template.get("params") or [])}
+            return self.send_with_template(recipient, message, template["name"],
+                                           template_params=params)
         return self.send(recipient, message)
 
 
