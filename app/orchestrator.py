@@ -8,20 +8,34 @@ Responsibilities:
   whatsapp -> whatsapp provider, email -> email provider). No cross-channel
   access.
 - Update per-channel status in the background and mark failures with reason.
+- Retry transient failures with exponential backoff before marking as failed.
 
 Adding a new channel later = add a provider + register it in the factory;
 the orchestrator needs no change.
 """
 import logging
+import random
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config import get_settings
-from app.database import create_message, get_group, get_message, update_status
-from app.providers.base import ProviderError, ProviderResult
+from app.database import (
+    create_message,
+    get_group,
+    get_message,
+    increment_attempt,
+    set_retry_schedule,
+    update_status,
+)
+from app.providers.base import (
+    ProviderError,
+    ProviderPermanentError,
+    ProviderResult,
+    ProviderTransientError,
+)
 from app.providers.factory import get_provider
 from app.schemas import Channel, NotificationEventRequest, SendRequest
 
@@ -30,27 +44,65 @@ logger = logging.getLogger("orchestrator")
 
 def _safe_send(message_id: str, channel: Channel, fn: Callable[..., ProviderResult]) -> None:
     """
-    Run one provider send and persist its outcome. Never leaves a message
-    'queued' forever: any failure is recorded with the reason.
+    Run one provider send with retry for transient errors.
+    Never leaves a message 'queued' forever: any failure is recorded with the reason.
     """
-    try:
-        result = fn()
-    except ProviderError as exc:
-        logger.warning("message %s failed via %s: %s", message_id, channel.value, exc)
-        update_status(message_id, status="failed", error=str(exc))
-        return
-    except Exception as exc:  # noqa: BLE001 - never leave a message 'queued' forever
-        logger.exception("unexpected error sending message %s", message_id)
-        update_status(message_id, status="failed", error=f"Unexpected error: {exc}")
-        return
+    settings = get_settings()
+    max_attempts = settings.RETRY_MAX_ATTEMPTS
+    backoff_base = settings.RETRY_BACKOFF_BASE_SECONDS
+    backoff_max = settings.RETRY_BACKOFF_MAX_SECONDS
 
-    update_status(
-        message_id,
-        status=result.status,
-        provider=result.provider_name,
-        provider_message_id=result.provider_message_id,
-    )
-    _maybe_simulate_delivery(message_id)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = fn()
+            update_status(
+                message_id,
+                status=result.status,
+                provider=result.provider_name,
+                provider_message_id=result.provider_message_id,
+            )
+            increment_attempt(message_id)
+            _maybe_simulate_delivery(message_id)
+            return
+        except ProviderPermanentError as exc:
+            logger.warning(
+                "message %s failed permanently via %s (attempt %d): %s",
+                message_id, channel.value, attempt, exc,
+            )
+            increment_attempt(message_id)
+            update_status(message_id, status="failed", error=str(exc))
+            return
+        except ProviderTransientError as exc:
+            logger.warning(
+                "message %s transient error via %s (attempt %d/%d): %s",
+                message_id, channel.value, attempt, max_attempts, exc,
+            )
+            increment_attempt(message_id)
+            if attempt == max_attempts:
+                update_status(
+                    message_id,
+                    status="failed",
+                    error=f"Failed after {attempt} attempts: {exc}",
+                )
+                return
+            delay = min(
+                backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 0.25),
+                backoff_max,
+            )
+            next_retry = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat()
+            set_retry_schedule(message_id, next_retry)
+            logger.info(
+                "message %s retry %d/%d in %.1fs",
+                message_id, attempt, max_attempts, delay,
+            )
+            time.sleep(delay)
+        except Exception as exc:
+            logger.exception("unexpected error sending message %s (attempt %d)", message_id, attempt)
+            increment_attempt(message_id)
+            update_status(message_id, status="failed", error=f"Unexpected error: {exc}")
+            return
+
+    update_status(message_id, status="failed", error=f"Failed after {max_attempts} attempts")
 
 
 def _maybe_simulate_delivery(message_id: str) -> None:
@@ -270,6 +322,7 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "attempt_count": row["attempt_count"] if "attempt_count" in row.keys() else 0,
             **detail,
         })
 
@@ -304,5 +357,6 @@ def get_message_summary(message_id: str) -> Optional[Dict]:
         "error": row["error"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "attempt_count": row["attempt_count"] if "attempt_count" in row.keys() else 0,
         **detail,
     }

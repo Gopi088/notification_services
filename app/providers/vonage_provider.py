@@ -24,7 +24,14 @@ from typing import Any, Dict
 import requests
 
 from app.config import get_settings
-from app.providers.base import NotificationProvider, ProviderConfigError, ProviderError, ProviderResult
+from app.providers.base import (
+    NotificationProvider,
+    ProviderConfigError,
+    ProviderError,
+    ProviderPermanentError,
+    ProviderResult,
+    ProviderTransientError,
+)
 from app.providers.azure_provider import _normalize_phone
 
 logger = logging.getLogger("vonage_provider")
@@ -54,7 +61,6 @@ class VonageSMSProvider(NotificationProvider):
         from vonage_messages import Sms
 
         to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
-        # Vonage expects digits only, no leading "+"
         to_digits = to.lstrip("+")
 
         logger.info(
@@ -69,13 +75,10 @@ class VonageSMSProvider(NotificationProvider):
             response = client.messages.send(
                 Sms(to=to_digits, from_=s.VONAGE_SMS_FROM, text=message)
             )
-        except Exception as exc:  # noqa: BLE001 - surface SDK errors cleanly
+        except Exception as exc:
             logger.error("[SMS] Vonage rejected message: %s", exc)
             raise ProviderError(f"Vonage SMS error: {exc}") from exc
 
-        # Vonage Messages API returns a SendMessageResponse object (pydantic
-        # model) with a message_uuid attribute. Older SDK versions may return a
-        # plain dict; handle both shapes.
         if hasattr(response, "message_uuid"):
             message_id = response.message_uuid
         elif isinstance(response, dict):
@@ -114,7 +117,6 @@ class VonageWhatsAppProvider(NotificationProvider):
             )
 
         to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
-        # Vonage expects digits only, no leading "+"
         to_digits = to.lstrip("+")
         sandbox_url = s.VONAGE_WHATSAPP_SANDBOX_URL
 
@@ -137,23 +139,38 @@ class VonageWhatsAppProvider(NotificationProvider):
                 json=payload,
                 timeout=30,
             )
-        except requests.RequestException as exc:  # network / timeout
+        except requests.ConnectionError as exc:
+            logger.error("[WhatsApp] Vonage connection failed: %s", exc)
+            raise ProviderTransientError(f"Vonage WhatsApp connection error: {exc}") from exc
+        except requests.Timeout as exc:
+            logger.error("[WhatsApp] Vonage request timed out: %s", exc)
+            raise ProviderTransientError(f"Vonage WhatsApp timeout: {exc}") from exc
+        except requests.RequestException as exc:
             logger.error("[WhatsApp] Vonage request failed: %s", exc)
-            raise ProviderError(f"Vonage WhatsApp network error: {exc}") from exc
+            raise ProviderTransientError(f"Vonage WhatsApp network error: {exc}") from exc
 
         if response.status_code == 401:
-            raise ProviderError(
+            raise ProviderPermanentError(
                 "Vonage WhatsApp authentication failed (401). Check VONAGE_API_KEY "
                 "and VONAGE_API_SECRET."
             )
         if response.status_code == 403:
-            raise ProviderError(
+            raise ProviderPermanentError(
                 "Vonage WhatsApp rejected the request (403). The recipient number "
                 "may not be allow-listed in the Vonage Messages Sandbox."
             )
+        if response.status_code == 429:
+            raise ProviderTransientError(
+                f"Vonage WhatsApp rate limited (429): {response.text}"
+            )
+        if response.status_code >= 500:
+            logger.error("[WhatsApp] Vonage server error: %s", response.text)
+            raise ProviderTransientError(
+                f"Vonage WhatsApp server error ({response.status_code}): {response.text}"
+            )
         if response.status_code >= 400:
             logger.error("[WhatsApp] Vonage rejected message: %s", response.text)
-            raise ProviderError(
+            raise ProviderPermanentError(
                 f"Vonage WhatsApp error ({response.status_code}): {response.text}"
             )
 

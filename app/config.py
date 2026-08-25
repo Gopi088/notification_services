@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     # the webhook; this threshold tells callers when to stop waiting.
     DELIVERY_TIMEOUT_SECONDS: int = 300
 
+    # --- Retry ---
+    RETRY_MAX_ATTEMPTS: int = 3
+    RETRY_BACKOFF_BASE_SECONDS: float = 0.5
+    RETRY_BACKOFF_MAX_SECONDS: float = 30.0
+
     # --- Vonage SMS (alternative SMS provider to Azure) ---
     # If VONAGE_API_KEY and VONAGE_API_SECRET are set, the SMS channel uses
     # Vonage instead of Azure. Credentials from the Vonage dashboard.

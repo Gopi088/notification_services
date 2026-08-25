@@ -21,7 +21,14 @@ from typing import Any, Dict, Optional
 import httpx
 
 from app.config import get_settings
-from app.providers.base import NotificationProvider, ProviderConfigError, ProviderError, ProviderResult
+from app.providers.base import (
+    NotificationProvider,
+    ProviderConfigError,
+    ProviderError,
+    ProviderPermanentError,
+    ProviderResult,
+    ProviderTransientError,
+)
 from app.templates import TemplateError, render_email
 
 logger = logging.getLogger("azure_provider")
@@ -81,12 +88,15 @@ class AzureSMSProvider(_AzureMixin, NotificationProvider):
                 message=message,
                 enable_delivery_report=True,
             )
-        except Exception as exc:  # noqa: BLE001 - surface SDK errors cleanly
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("timeout", "connection", "network", "retry")):
+                raise ProviderTransientError(f"Azure SMS error: {exc}") from exc
             raise ProviderError(f"Azure SMS error: {exc}") from exc
 
         result = results[0]
         if not result.successful:
-            raise ProviderError(f"Azure SMS failed for {result.to}: {result.error_message}")
+            raise ProviderPermanentError(f"Azure SMS failed for {result.to}: {result.error_message}")
 
         return ProviderResult(self.name, result.message_id, "sent")
 
@@ -150,7 +160,10 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
             email_client = EmailClient.from_connection_string(self._connection_string())
             poller = email_client.begin_send(email_message)
             result = poller.result()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("timeout", "connection", "network", "retry")):
+                raise ProviderTransientError(f"Azure Email error: {exc}") from exc
             raise ProviderError(f"Azure Email error: {exc}") from exc
 
         message_id = result.get("message_id", "") if isinstance(result, dict) else str(result)
@@ -178,16 +191,16 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
         (mitigates SSRF via user-supplied attachment URLs)."""
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "https":
-            raise ProviderError(
+            raise ProviderPermanentError(
                 f"Attachment url must use https, got '{parsed.scheme or 'none'}'."
             )
         host = parsed.hostname
         if not host:
-            raise ProviderError(f"Attachment url has no host: {url}")
+            raise ProviderPermanentError(f"Attachment url has no host: {url}")
         if parsed.username or parsed.password:
-            raise ProviderError("Attachment url must not contain credentials.")
+            raise ProviderPermanentError("Attachment url must not contain credentials.")
         if host.lower() == "localhost":
-            raise ProviderError("Attachment url must not point at localhost.")
+            raise ProviderPermanentError("Attachment url must not point at localhost.")
         try:
             addr = ipaddress.ip_address(host)
             ips = [addr]
@@ -205,7 +218,7 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
                 or ip.is_reserved
                 or ip.is_unspecified
             ):
-                raise ProviderError(f"Attachment url resolves to a blocked address: {ip}.")
+                raise ProviderPermanentError(f"Attachment url resolves to a blocked address: {ip}.")
 
     @staticmethod
     def _fetch_as_base64(url: str) -> str:
@@ -233,10 +246,13 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
                                 reason = f"Attachment from {url} exceeds {MAX_ATTACHMENT_BYTES} bytes."
                                 break
                             chunks.append(chunk)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("timeout", "connection", "network")):
+                raise ProviderTransientError(f"Could not download attachment from {url}: {exc}") from exc
             raise ProviderError(f"Could not download attachment from {url}: {exc}") from exc
         if reason is not None:
-            raise ProviderError(reason)
+            raise ProviderPermanentError(reason)
         return base64.b64encode(b"".join(chunks)).decode("ascii")
 
     def send_with_template(
@@ -321,8 +337,10 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
                 content=message,
             )
             response = client.send(content)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[WhatsApp] Azure rejected text message: %s", exc)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("timeout", "connection", "network", "retry")):
+                raise ProviderTransientError(f"Azure WhatsApp error: {exc}") from exc
             raise ProviderError(f"Azure WhatsApp error: {exc}") from exc
 
         if not response.receipts:
@@ -330,7 +348,7 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
         receipt = response.receipts[0]
         if getattr(receipt, "error", None):
             logger.error("[WhatsApp] Azure returned an error for %s: %s", receipt.to, receipt.error)
-            raise ProviderError(f"Azure WhatsApp failed for {receipt.to}: {receipt.error}")
+            raise ProviderPermanentError(f"Azure WhatsApp failed for {receipt.to}: {receipt.error}")
 
         self._log("Azure message ID:", receipt.message_id)
         self._log("Provider accepted message")
@@ -431,8 +449,10 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
         try:
             client = NotificationMessagesClient.from_connection_string(self._connection_string())
             response = client.send(content)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[WhatsApp] Azure rejected template %s: %s", template_name, exc)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if any(k in msg for k in ("timeout", "connection", "network", "retry")):
+                raise ProviderTransientError(f"Azure WhatsApp template error: {exc}") from exc
             raise ProviderError(f"Azure WhatsApp template error: {exc}") from exc
 
         if not response.receipts:
@@ -440,7 +460,7 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
         receipt = response.receipts[0]
         if getattr(receipt, "error", None):
             logger.error("[WhatsApp] Azure returned an error for %s: %s", receipt.to, receipt.error)
-            raise ProviderError(f"Azure WhatsApp template failed for {receipt.to}: {receipt.error}")
+            raise ProviderPermanentError(f"Azure WhatsApp template failed for {receipt.to}: {receipt.error}")
 
         self._log("Azure message ID:", receipt.message_id)
         self._log("Provider accepted message")

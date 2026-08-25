@@ -15,6 +15,14 @@ class ProviderConfigError(ProviderError):
     """Raised when required provider credentials/config are missing."""
 
 
+class ProviderTransientError(ProviderError):
+    """Network timeouts, HTTP 429/5xx -- safe to retry."""
+
+
+class ProviderPermanentError(ProviderError):
+    """Bad credentials (401/403), invalid recipient, rejected payload (400) -- never retry."""
+
+
 @dataclass
 class ProviderResult:
     provider_name: str

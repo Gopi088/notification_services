@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.auth import require_api_key
 from app.database import get_message
+from app.errors import ErrorCode, NotFoundError, ValidationError
 from app.orchestrator import get_message_summary, orchestrate_send
 from app.schemas import Channel, SendRequest as V1SendRequest, ChannelRequest
 from app.validation import ContactValidationError, validate_contact
@@ -37,22 +38,17 @@ class LegacySendRequest(BaseModel):
         return v
 
 
-class LegacyError(BaseModel):
-    detail: str
-
-
 @router.post(
     "/send",
     status_code=202,
     summary="Queue a message for delivery (legacy single-channel API)",
-    responses={400: {"model": LegacyError}},
     dependencies=[Depends(require_api_key)],
 )
 def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks) -> dict:
     try:
         validate_contact(payload.channel, payload.contact)
     except ContactValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise ValidationError(str(exc), field="contact") from exc
 
     summary = orchestrate_send(
         V1SendRequest(
@@ -62,20 +58,20 @@ def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks) 
         background_tasks,
     )
     first = summary["channels"][0]
-    return {"message_id": first["message_id"], "status": "queued"}
+    return {"success": True, "message_id": first["message_id"], "status": "queued"}
 
 
 @router.get(
     "/status/{message_id}",
     summary="Get delivery status (legacy API)",
-    responses={404: {"model": LegacyError}},
     dependencies=[Depends(require_api_key)],
 )
 def get_status(message_id: str) -> dict:
     row = get_message(message_id)
     if row is None:
-        raise HTTPException(status_code=404, detail=f"No message found with id '{message_id}'")
+        raise NotFoundError(f"No message found with id '{message_id}'")
     return {
+        "success": True,
         "message_id": row["message_id"],
         "channel": row["channel"],
         "contact": row["contact"],

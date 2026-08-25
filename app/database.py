@@ -40,6 +40,10 @@ _MIGRATIONS = [
     "ALTER TABLE messages ADD COLUMN group_id TEXT",
     # 0.2 -> 0.3: add caller reference for grouped sends
     "ALTER TABLE messages ADD COLUMN reference TEXT",
+    # 0.3 -> 0.4: retry support
+    "ALTER TABLE messages ADD COLUMN attempt_count INTEGER DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN next_retry_at TEXT",
+    "ALTER TABLE messages ADD COLUMN last_attempt_at TEXT",
 ]
 
 
@@ -147,3 +151,34 @@ def list_messages(limit: int = 50, channel: Optional[str] = None) -> Sequence[sq
                 (limit,),
             )
         return cur.fetchall()
+
+
+def increment_attempt(message_id: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE messages
+               SET attempt_count = attempt_count + 1,
+                   last_attempt_at = ?,
+                   updated_at = ?
+               WHERE message_id = ?""",
+            (_now(), _now(), message_id),
+        )
+
+
+def set_retry_schedule(message_id: str, next_retry_at: str) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE messages
+               SET next_retry_at = ?, status = 'queued', updated_at = ?
+               WHERE message_id = ?""",
+            (next_retry_at, _now(), message_id),
+        )
+
+
+def get_message_with_retry(message_id: str) -> Optional[sqlite3.Row]:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM messages WHERE message_id = ?",
+            (message_id,),
+        )
+        return cur.fetchone()

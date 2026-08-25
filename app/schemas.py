@@ -118,6 +118,7 @@ class ChannelStatus(BaseModel):
     error: Optional[str] = None
     created_at: str
     updated_at: str
+    attempt_count: int = 0
     # Seconds elapsed since the message was created (how long to wait so far).
     elapsed_seconds: Optional[float] = None
     # True when still queued/sent and elapsed_seconds > delivery_timeout_seconds.

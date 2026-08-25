@@ -9,13 +9,12 @@ Design:
   leak into responses.
 - Uniform envelope: {success, data-or-error} so callers parse one shape.
 """
-from typing import Optional
-
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends
 
 from app import __version__
 from app.auth import require_api_key
 from app.config import get_settings
+from app.errors import NotFoundError, ValidationError
 from app.orchestrator import (
     get_group_summary,
     get_message_summary,
@@ -37,13 +36,6 @@ from app.validation import ContactValidationError, validate_contact
 router = APIRouter(prefix="/api/v1", tags=["v1"])
 
 _settings = get_settings()
-
-
-def _send_error(code: str, message: str, field: Optional[str] = None) -> HTTPException:
-    return HTTPException(
-        status_code=400,
-        detail=ErrorResponse(error={"code": code, "message": message, "field": field}).model_dump(),
-    )
 
 
 @router.get(
@@ -80,7 +72,7 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks) -> SendRespons
         try:
             validate_contact(cr.channel, cr.contact)
         except ContactValidationError as exc:
-            raise _send_error("validation_error", str(exc), field="channels") from exc
+            raise ValidationError(str(exc), field="channels") from exc
 
     summary = orchestrate_send(payload, background_tasks)
     return SendResponse(
@@ -113,7 +105,7 @@ def send_event(payload: NotificationEventRequest, background_tasks: BackgroundTa
         try:
             validate_contact(delivery.channel, delivery.payload.recipient)
         except ContactValidationError as exc:
-            raise _send_error("validation_error", str(exc), field="deliveries") from exc
+            raise ValidationError(str(exc), field="deliveries") from exc
 
     summary = orchestrate_event(payload, background_tasks)
     return SendResponse(
@@ -161,6 +153,7 @@ def status(notification_id: str) -> StatusResponse:
                     error=single["error"],
                     created_at=single["created_at"],
                     updated_at=single["updated_at"],
+                    attempt_count=single.get("attempt_count", 0),
                     elapsed_seconds=single.get("elapsed_seconds"),
                     timed_out=single.get("timed_out", False),
                     delivery_timeout_seconds=single.get("delivery_timeout_seconds"),
@@ -168,9 +161,4 @@ def status(notification_id: str) -> StatusResponse:
             ],
         )
 
-    raise HTTPException(
-        status_code=404,
-        detail=ErrorResponse(
-            error={"code": "not_found", "message": f"No notification found with id '{notification_id}'"}
-        ).model_dump(),
-    )
+    raise NotFoundError(f"No notification found with id '{notification_id}'")

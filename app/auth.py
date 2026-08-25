@@ -10,9 +10,10 @@ Identity is the API key itself; it is never exposed in responses or logs.
 import hmac
 import secrets
 
-from fastapi import Header, HTTPException
+from fastapi import Header
 
 from app.config import get_settings
+from app.errors import AppError, ErrorCode, UnauthorizedError
 
 
 def require_api_key(x_api_key: str = Header(default="")) -> None:
@@ -20,27 +21,10 @@ def require_api_key(x_api_key: str = Header(default="")) -> None:
         return
     expected = get_settings().AUTH_API_KEY
     if not expected:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "success": False,
-                "error": {
-                    "code": "server_config_error",
-                    "message": "AUTH_ENABLED=true but AUTH_API_KEY is not set in .env.",
-                    "field": None,
-                },
-            },
+        raise AppError(
+            code=ErrorCode.INTERNAL_ERROR,
+            message="AUTH_ENABLED=true but AUTH_API_KEY is not set in .env.",
+            http_status=500,
         )
     if not x_api_key or not secrets.compare_digest(x_api_key, expected):
-        raise HTTPException(
-            status_code=401,
-            headers={"WWW-Authenticate": "ApiKey"},
-            detail={
-                "success": False,
-                "error": {
-                    "code": "unauthorized",
-                    "message": "Invalid or missing API key. Send X-API-Key header.",
-                    "field": None,
-                },
-            },
-        )
+        raise UnauthorizedError("Invalid or missing API key. Send X-API-Key header.")
