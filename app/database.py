@@ -8,15 +8,15 @@ A `group_id` links every channel attempt for one logical send, so a single
 request fanning out to whatsapp+sms+email shares a group and can be queried
 together via GET /api/v1/notifications/{group_id}/status.
 """
+import hashlib
+import json
 import re
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
-from typing import Optional, Sequence
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Sequence
 
 from app.config import get_settings
-
-_settings = get_settings()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -35,6 +35,30 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 """
 
+_API_KEYS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS api_keys (
+    key_hash                TEXT PRIMARY KEY,
+    name                    TEXT NOT NULL,
+    tenant_id               TEXT NOT NULL,
+    scopes                  TEXT NOT NULL DEFAULT '[]',
+    rate_limit_per_second   INTEGER,
+    is_active               INTEGER NOT NULL DEFAULT 1,
+    created_at              TEXT NOT NULL,
+    expires_at              TEXT
+);
+"""
+
+_IDEMPOTENCY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS idempotency_keys (
+    idempotency_key TEXT PRIMARY KEY,
+    message_id      TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'processing',
+    response_body   TEXT,
+    created_at      TEXT NOT NULL,
+    expires_at      TEXT NOT NULL
+);
+"""
+
 _MIGRATIONS = [
     # 0.1 -> 0.2: add group_id for multi-channel sends
     "ALTER TABLE messages ADD COLUMN group_id TEXT",
@@ -49,8 +73,11 @@ _MIGRATIONS = [
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(_settings.DATABASE_PATH)
+    settings = get_settings()
+    conn = sqlite3.connect(settings.DATABASE_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -59,8 +86,12 @@ def get_connection():
 
 
 def init_db() -> None:
+    from app.audit import AUDIT_SCHEMA
     with get_connection() as conn:
         conn.execute(SCHEMA)
+        conn.execute(_API_KEYS_SCHEMA)
+        conn.execute(_IDEMPOTENCY_SCHEMA)
+        conn.execute(AUDIT_SCHEMA)
         columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
         for stmt in _MIGRATIONS:
             match = re.search(r"ADD COLUMN (\S+)", stmt)
@@ -68,9 +99,14 @@ def init_db() -> None:
             if col not in columns:
                 conn.execute(stmt)
 
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
 
 def create_message(
     message_id: str,
@@ -175,10 +211,147 @@ def set_retry_schedule(message_id: str, next_retry_at: str) -> None:
         )
 
 
-def get_message_with_retry(message_id: str) -> Optional[sqlite3.Row]:
+def reset_stale_processing(stale_timeout_minutes: int = 5) -> int:
+    """Reset messages stuck in PROCESSING state back to QUEUED.
+
+    Returns the number of messages reset.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=stale_timeout_minutes)).isoformat()
     with get_connection() as conn:
         cur = conn.execute(
-            "SELECT * FROM messages WHERE message_id = ?",
-            (message_id,),
+            """UPDATE messages
+               SET status = 'queued', updated_at = ?
+               WHERE status = 'processing' AND updated_at < ?""",
+            (_now(), cutoff),
         )
-        return cur.fetchone()
+        return cur.rowcount
+
+
+# ---------------------------------------------------------------------------
+# API Keys
+# ---------------------------------------------------------------------------
+
+def hash_api_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def create_api_key(
+    key_hash: str,
+    name: str,
+    tenant_id: str,
+    scopes: list[str],
+    rate_limit_per_second: Optional[int] = None,
+    expires_at: Optional[str] = None,
+) -> None:
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT INTO api_keys
+               (key_hash, name, tenant_id, scopes, rate_limit_per_second, is_active, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, 1, ?, ?)""",
+            (key_hash, name, tenant_id, json.dumps(scopes), rate_limit_per_second, _now(), expires_at),
+        )
+
+
+def get_api_key(key_hash: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM api_keys WHERE key_hash = ? AND is_active = 1",
+            (key_hash,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["scopes"] = json.loads(result["scopes"]) if result["scopes"] else []
+        return result
+
+
+def revoke_api_key(key_hash: str) -> bool:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "UPDATE api_keys SET is_active = 0 WHERE key_hash = ?",
+            (key_hash,),
+        )
+        return cur.rowcount > 0
+
+
+def list_api_keys(limit: int = 50) -> list[Dict[str, Any]]:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT key_hash, name, tenant_id, scopes, rate_limit_per_second, is_active, created_at, expires_at FROM api_keys ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        result = []
+        for row in rows:
+            r = dict(row)
+            r["scopes"] = json.loads(r["scopes"]) if r["scopes"] else []
+            result.append(r)
+        return result
+
+
+# ---------------------------------------------------------------------------
+# Idempotency
+# ---------------------------------------------------------------------------
+
+def get_idempotency(key: str) -> Optional[Dict[str, Any]]:
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT * FROM idempotency_keys WHERE idempotency_key = ?",
+            (key,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        # Parse cached response if present
+        if result.get("response_body"):
+            try:
+                result["response_body"] = json.loads(result["response_body"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return result
+
+
+def create_idempotency(
+    key: str,
+    message_id: str,
+    status: str = "processing",
+    response_body: Optional[Dict] = None,
+    ttl_hours: int = 24,
+) -> None:
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(hours=ttl_hours)).isoformat()
+    body_json = json.dumps(response_body) if response_body else None
+    with get_connection() as conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO idempotency_keys
+               (idempotency_key, message_id, status, response_body, created_at, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (key, message_id, status, body_json, now.isoformat(), expires),
+        )
+
+
+def update_idempotency(
+    key: str,
+    status: str,
+    response_body: Optional[Dict] = None,
+) -> None:
+    body_json = json.dumps(response_body) if response_body else None
+    with get_connection() as conn:
+        conn.execute(
+            """UPDATE idempotency_keys
+               SET status = ?, response_body = COALESCE(?, response_body)
+               WHERE idempotency_key = ?""",
+            (status, body_json, key),
+        )
+
+
+def cleanup_expired_idempotency() -> int:
+    """Delete expired idempotency keys. Returns count deleted."""
+    with get_connection() as conn:
+        cur = conn.execute(
+            "DELETE FROM idempotency_keys WHERE expires_at < ?",
+            (_now(),),
+        )
+        return cur.rowcount

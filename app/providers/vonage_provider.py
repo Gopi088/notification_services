@@ -18,6 +18,7 @@ mirroring the working cURL command:
 Vonage expects the `to` number WITHOUT the leading "+" (digits only, 7-15).
 """
 import logging
+import time
 import uuid
 from typing import Any, Dict
 
@@ -64,10 +65,12 @@ class VonageSMSProvider(NotificationProvider):
         to_digits = to.lstrip("+")
 
         logger.info(
-            "[SMS] Provider: Vonage | From: %s | To: %s",
+            "Calling Vonage SMS API: from=%s to=%s",
             s.VONAGE_SMS_FROM, to,
+            extra={"provider": self.name},
         )
 
+        start = time.monotonic()
         try:
             client = Vonage(
                 Auth(api_key=s.VONAGE_API_KEY, api_secret=s.VONAGE_API_SECRET)
@@ -76,8 +79,15 @@ class VonageSMSProvider(NotificationProvider):
                 Sms(to=to_digits, from_=s.VONAGE_SMS_FROM, text=message)
             )
         except Exception as exc:
-            logger.error("[SMS] Vonage rejected message: %s", exc)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            logger.error(
+                "Vonage SMS API rejected message: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderError(f"Vonage SMS error: {exc}") from exc
+
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
 
         if hasattr(response, "message_uuid"):
             message_id = response.message_uuid
@@ -86,9 +96,19 @@ class VonageSMSProvider(NotificationProvider):
         else:
             message_id = None
         if not message_id:
+            logger.error(
+                "Vonage SMS API returned no message_id: response=%s duration=%.1fms",
+                response, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderError(f"Vonage SMS returned no message id: {response}")
 
-        logger.info("[SMS] Vonage message ID: %s | Provider accepted message", message_id)
+        logger.info(
+            "Vonage SMS API accepted message: provider_msg_id=%s duration=%.1fms",
+            message_id, elapsed_ms,
+            extra={"provider": self.name, "provider_msg_id": message_id,
+                   "duration_ms": elapsed_ms},
+        )
         return ProviderResult(self.name, message_id, "sent")
 
     def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
@@ -120,8 +140,11 @@ class VonageWhatsAppProvider(NotificationProvider):
         to_digits = to.lstrip("+")
         sandbox_url = s.VONAGE_WHATSAPP_SANDBOX_URL
 
-        logger.info("[WhatsApp] Provider: Vonage Sandbox")
-        logger.info("[WhatsApp] From: %s | To: %s", s.VONAGE_WHATSAPP_FROM, to)
+        logger.info(
+            "Calling Vonage WhatsApp API: from=%s to=%s endpoint=%s",
+            s.VONAGE_WHATSAPP_FROM, to, sandbox_url,
+            extra={"provider": self.name},
+        )
 
         payload = {
             "from": s.VONAGE_WHATSAPP_FROM,
@@ -131,6 +154,7 @@ class VonageWhatsAppProvider(NotificationProvider):
             "channel": "whatsapp",
         }
 
+        start = time.monotonic()
         try:
             response = requests.post(
                 sandbox_url,
@@ -140,36 +164,81 @@ class VonageWhatsAppProvider(NotificationProvider):
                 timeout=30,
             )
         except requests.ConnectionError as exc:
-            logger.error("[WhatsApp] Vonage connection failed: %s", exc)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            logger.error(
+                "Vonage WhatsApp connection failed: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderTransientError(f"Vonage WhatsApp connection error: {exc}") from exc
         except requests.Timeout as exc:
-            logger.error("[WhatsApp] Vonage request timed out: %s", exc)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            logger.error(
+                "Vonage WhatsApp request timed out: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderTransientError(f"Vonage WhatsApp timeout: {exc}") from exc
         except requests.RequestException as exc:
-            logger.error("[WhatsApp] Vonage request failed: %s", exc)
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+            logger.error(
+                "Vonage WhatsApp request failed: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderTransientError(f"Vonage WhatsApp network error: {exc}") from exc
 
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+
         if response.status_code == 401:
+            logger.error(
+                "Vonage WhatsApp auth failed (401): check credentials, duration=%.1fms",
+                elapsed_ms,
+                extra={"provider": self.name, "status_code": 401,
+                       "duration_ms": elapsed_ms},
+            )
             raise ProviderPermanentError(
                 "Vonage WhatsApp authentication failed (401). Check VONAGE_API_KEY "
                 "and VONAGE_API_SECRET."
             )
         if response.status_code == 403:
+            logger.error(
+                "Vonage WhatsApp forbidden (403): recipient may not be allow-listed, duration=%.1fms",
+                elapsed_ms,
+                extra={"provider": self.name, "status_code": 403,
+                       "duration_ms": elapsed_ms},
+            )
             raise ProviderPermanentError(
                 "Vonage WhatsApp rejected the request (403). The recipient number "
                 "may not be allow-listed in the Vonage Messages Sandbox."
             )
         if response.status_code == 429:
+            logger.warning(
+                "Vonage WhatsApp rate limited (429): duration=%.1fms",
+                elapsed_ms,
+                extra={"provider": self.name, "status_code": 429,
+                       "duration_ms": elapsed_ms},
+            )
             raise ProviderTransientError(
                 f"Vonage WhatsApp rate limited (429): {response.text}"
             )
         if response.status_code >= 500:
-            logger.error("[WhatsApp] Vonage server error: %s", response.text)
+            logger.error(
+                "Vonage WhatsApp server error (%d): body=%s duration=%.1fms",
+                response.status_code, response.text, elapsed_ms,
+                extra={"provider": self.name, "status_code": response.status_code,
+                       "duration_ms": elapsed_ms},
+            )
             raise ProviderTransientError(
                 f"Vonage WhatsApp server error ({response.status_code}): {response.text}"
             )
         if response.status_code >= 400:
-            logger.error("[WhatsApp] Vonage rejected message: %s", response.text)
+            logger.error(
+                "Vonage WhatsApp client error (%d): body=%s duration=%.1fms",
+                response.status_code, response.text, elapsed_ms,
+                extra={"provider": self.name, "status_code": response.status_code,
+                       "duration_ms": elapsed_ms},
+            )
             raise ProviderPermanentError(
                 f"Vonage WhatsApp error ({response.status_code}): {response.text}"
             )
@@ -181,9 +250,19 @@ class VonageWhatsAppProvider(NotificationProvider):
 
         message_id = result.get("message_uuid")
         if not message_id:
+            logger.error(
+                "Vonage WhatsApp returned no message_id: response=%s duration=%.1fms",
+                result, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderError(f"Vonage WhatsApp returned no message id: {result}")
 
-        logger.info("[WhatsApp] Vonage message ID: %s | Provider accepted message", message_id)
+        logger.info(
+            "Vonage WhatsApp API accepted message: provider_msg_id=%s status=%d duration=%.1fms",
+            message_id, response.status_code, elapsed_ms,
+            extra={"provider": self.name, "provider_msg_id": message_id,
+                   "status_code": response.status_code, "duration_ms": elapsed_ms},
+        )
         return ProviderResult(self.name, message_id, "sent")
 
     def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:

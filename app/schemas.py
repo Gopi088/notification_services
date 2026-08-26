@@ -1,8 +1,7 @@
 """
 Versioned (v1) API schemas.
 
-The public contract is stable: request/response shapes are decoupled from the
-internal provider/model layer, so internals are never leaked to callers.
+Single channel per request. One send = one channel = one contact.
 """
 from enum import Enum
 from typing import Any, Dict, List, Optional, Union
@@ -16,14 +15,13 @@ class Channel(str, Enum):
     email = "email"
 
 
-# Internally we may add channels (telegram, push, ...) without touching the
-# public v1 enum above. Channels are validated at the API layer.
 class Status(str, Enum):
     queued = "queued"
+    processing = "processing"
+    retrying = "retrying"
     sent = "sent"
     delivered = "delivered"
     failed = "failed"
-    partial = "partial"
 
 
 class TemplateParam(BaseModel):
@@ -33,18 +31,20 @@ class TemplateParam(BaseModel):
     value: str = Field(..., description="Value substituted into the template")
 
 
-class ChannelRequest(BaseModel):
-    """One medium (channel) within a send request."""
+class SendRequest(BaseModel):
+    """One send = one channel = one contact."""
 
-    channel: Channel
+    channel: Channel = Field(..., description="whatsapp, sms, or email")
     contact: str = Field(
         ...,
         min_length=3,
         max_length=254,
-        description="Phone number (E.164-ish) for whatsapp/sms, email address for email",
+        description="Phone number (E.164) for whatsapp/sms, email address for email",
     )
-    # External template support: if provided, the channel renders the message
-    # through that template instead of free text.
+    message: str = Field(..., min_length=1, max_length=4096)
+    reference: Optional[str] = Field(
+        None, max_length=128, description="Caller-supplied reference, e.g. an order id"
+    )
     template_name: Optional[str] = Field(
         None, description="Approved external template name (WhatsApp: Meta template)"
     )
@@ -60,18 +60,6 @@ class ChannelRequest(BaseModel):
     def strip_contact(cls, v: str) -> str:
         return v.strip()
 
-
-class SendRequest(BaseModel):
-    """A send may target one or more channels; each channel carries its own contact/template."""
-
-    channels: List[ChannelRequest] = Field(
-        ..., min_length=1, description="One or more channels to deliver through"
-    )
-    message: str = Field(..., min_length=1, max_length=4096)
-    reference: Optional[str] = Field(
-        None, max_length=128, description="Caller-supplied reference, e.g. an order id"
-    )
-
     @field_validator("message")
     @classmethod
     def strip_message(cls, v: str) -> str:
@@ -80,32 +68,16 @@ class SendRequest(BaseModel):
             raise ValueError("message cannot be empty")
         return v
 
-    @field_validator("channels")
-    @classmethod
-    def reject_duplicate_channels(cls, v: List[ChannelRequest]) -> List[ChannelRequest]:
-        seen = set()
-        for c in v:
-            if c.channel in seen:
-                raise ValueError(f"channel '{c.channel.value}' specified more than once")
-            seen.add(c.channel)
-        return v
-
-
-class ChannelQueued(BaseModel):
-    message_id: str
-    channel: str
-    status: Status
-    contact: str
-
 
 class SendResponse(BaseModel):
-    """Accepted send. `message_id` is the group id; per-channel ids are in `channels`."""
+    """Accepted send response."""
 
     success: bool = True
     message_id: str
     reference: Optional[str] = None
+    channel: str
+    contact: str
     status: Status = Status.queued
-    channels: List[ChannelQueued]
 
 
 class ChannelStatus(BaseModel):
@@ -119,9 +91,7 @@ class ChannelStatus(BaseModel):
     created_at: str
     updated_at: str
     attempt_count: int = 0
-    # Seconds elapsed since the message was created (how long to wait so far).
     elapsed_seconds: Optional[float] = None
-    # True when still queued/sent and elapsed_seconds > delivery_timeout_seconds.
     timed_out: bool = False
     delivery_timeout_seconds: Optional[int] = None
 
@@ -131,7 +101,7 @@ class StatusResponse(BaseModel):
     message_id: str
     reference: Optional[str] = None
     status: Status
-    channels: List[ChannelStatus]
+    channel: ChannelStatus
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +198,9 @@ class DeliveryRequest(BaseModel):
 
 class NotificationEventRequest(BaseModel):
     """
-    Event-driven send: one envelope, one delivery per channel.
+    Event-driven send: one envelope, one delivery.
 
-    Example: an interview_confirmation event fanning out to whatsapp + sms +
-    email, each delivery carrying its own recipient and channel-specific fields.
+    Example: an interview_confirmation event sent to whatsapp.
     """
 
     request_id: Optional[str] = Field(None, max_length=128, description="Caller-supplied request id")
@@ -244,8 +213,8 @@ class NotificationEventRequest(BaseModel):
             "used as fallback WhatsApp template params."
         ),
     )
-    deliveries: List[DeliveryRequest] = Field(
-        ..., min_length=1, description="One delivery per channel"
+    delivery: DeliveryRequest = Field(
+        ..., description="Single delivery (channel + payload)"
     )
 
 

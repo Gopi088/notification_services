@@ -8,3 +8,4 @@ azure-communication-email==1.1.0
 azure-communication-messages==1.1.0
 vonage==4.8.2
 vonage-messages==1.7.1
+pytest>=8.0.0

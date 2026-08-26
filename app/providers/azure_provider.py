@@ -14,6 +14,7 @@ import ipaddress
 import logging
 import re
 import socket
+import time
 import urllib.parse
 import uuid
 from typing import Any, Dict, Optional
@@ -80,24 +81,50 @@ class AzureSMSProvider(_AzureMixin, NotificationProvider):
                 "(your SMS-enabled ACS phone number, E.164, e.g. +919812345678)."
             )
 
+        to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
+        logger.info(
+            "Calling Azure SMS API: from=%s to=%s",
+            s.AZURE_SMS_FROM, to,
+            extra={"provider": self.name},
+        )
+
+        start = time.monotonic()
         try:
             sms_client = SmsClient.from_connection_string(self._connection_string())
             results = sms_client.send(
                 from_=s.AZURE_SMS_FROM,
-                to=_normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE),
+                to=to,
                 message=message,
                 enable_delivery_report=True,
             )
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
             msg = str(exc).lower()
+            logger.error(
+                "Azure SMS API error: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             if any(k in msg for k in ("timeout", "connection", "network", "retry")):
                 raise ProviderTransientError(f"Azure SMS error: {exc}") from exc
             raise ProviderError(f"Azure SMS error: {exc}") from exc
 
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
         result = results[0]
         if not result.successful:
+            logger.error(
+                "Azure SMS failed for recipient: error=%s duration=%.1fms",
+                result.error_message, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderPermanentError(f"Azure SMS failed for {result.to}: {result.error_message}")
 
+        logger.info(
+            "Azure SMS API accepted message: provider_msg_id=%s status=sent duration=%.1fms",
+            result.message_id, elapsed_ms,
+            extra={"provider": self.name, "provider_msg_id": result.message_id,
+                   "duration_ms": elapsed_ms},
+        )
         return ProviderResult(self.name, result.message_id, "sent")
 
     def send_delivery(self, payload: Dict[str, Any], data: Any = None) -> ProviderResult:
@@ -156,17 +183,37 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
         if attachments:
             email_message["attachments"] = self._build_attachments(attachments)
 
+        logger.info(
+            "Calling Azure Email API: from=%s subject=%s",
+            s.AZURE_EMAIL_FROM, subject,
+            extra={"provider": self.name},
+        )
+
+        start = time.monotonic()
         try:
             email_client = EmailClient.from_connection_string(self._connection_string())
             poller = email_client.begin_send(email_message)
             result = poller.result()
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
             msg = str(exc).lower()
+            logger.error(
+                "Azure Email API error: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             if any(k in msg for k in ("timeout", "connection", "network", "retry")):
                 raise ProviderTransientError(f"Azure Email error: {exc}") from exc
             raise ProviderError(f"Azure Email error: {exc}") from exc
 
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
         message_id = result.get("message_id", "") if isinstance(result, dict) else str(result)
+        logger.info(
+            "Azure Email API accepted message: provider_msg_id=%s status=sent duration=%.1fms",
+            message_id, elapsed_ms,
+            extra={"provider": self.name, "provider_msg_id": message_id,
+                   "duration_ms": elapsed_ms},
+        )
         return ProviderResult(self.name, message_id, "sent")
 
     @staticmethod
@@ -299,21 +346,12 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
 class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
     name = "azure_whatsapp"
 
-    def _log(self, *parts: Any) -> None:
-        logger.info("[WhatsApp] %s", " ".join(str(p) for p in parts))
-
     def send(self, contact: str, message: str) -> ProviderResult:
         if self.settings.MOCK_MODE:
             return ProviderResult(self.name, f"mock-{uuid.uuid4().hex[:12]}", "sent")
 
         s = self.settings
         to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
-        self._log("Provider: Azure Communication Services")
-        self._log("From:", s.whatsapp_from or "channel-linked business number")
-        self._log("To:", to)
-        self._log("Channel ID:", s.whatsapp_channel_id)
-        self._log("Mode:", "REAL" if not s.MOCK_MODE else "MOCK")
-        self._log("Message type: TEXT (24h session window)")
 
         if not s.whatsapp_channel_id:
             raise ProviderConfigError(
@@ -321,14 +359,16 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
                 "in .env (WhatsApp channel registration ID from the Azure portal)."
             )
 
-        # Free-form text is ONLY delivered inside a 24h session window (the
-        # recipient messaged the business number first). It is sent as-is; it
-        # is never swapped for a template, so the caller's message reaches the
-        # recipient when a session is open.
         from azure.communication.messages import NotificationMessagesClient
         from azure.communication.messages.models import TextNotificationContent
 
-        self._log("Sending text message...")
+        logger.info(
+            "Calling Azure WhatsApp API (text): to=%s channel_id=%s",
+            to, s.whatsapp_channel_id,
+            extra={"provider": self.name},
+        )
+
+        start = time.monotonic()
         try:
             client = NotificationMessagesClient.from_connection_string(self._connection_string())
             content = TextNotificationContent(
@@ -338,20 +378,41 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
             )
             response = client.send(content)
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
             msg = str(exc).lower()
+            logger.error(
+                "Azure WhatsApp API error: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             if any(k in msg for k in ("timeout", "connection", "network", "retry")):
                 raise ProviderTransientError(f"Azure WhatsApp error: {exc}") from exc
             raise ProviderError(f"Azure WhatsApp error: {exc}") from exc
 
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+
         if not response.receipts:
+            logger.error(
+                "Azure WhatsApp returned no receipts, duration=%.1fms",
+                elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderError("Azure WhatsApp returned no delivery receipt.")
         receipt = response.receipts[0]
         if getattr(receipt, "error", None):
-            logger.error("[WhatsApp] Azure returned an error for %s: %s", receipt.to, receipt.error)
+            logger.error(
+                "Azure WhatsApp recipient error: to=%s error=%s duration=%.1fms",
+                receipt.to, receipt.error, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderPermanentError(f"Azure WhatsApp failed for {receipt.to}: {receipt.error}")
 
-        self._log("Azure message ID:", receipt.message_id)
-        self._log("Provider accepted message")
+        logger.info(
+            "Azure WhatsApp API accepted message: provider_msg_id=%s status=sent duration=%.1fms",
+            receipt.message_id, elapsed_ms,
+            extra={"provider": self.name, "provider_msg_id": receipt.message_id,
+                   "duration_ms": elapsed_ms},
+        )
         return ProviderResult(self.name, receipt.message_id, "sent")
 
     def send_template(
@@ -363,17 +424,7 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
     ) -> ProviderResult:
         """
         Send an approved Meta/WhatsApp template to a contact via Azure
-        Communication Services Advanced Messaging. This is the ONLY way to
-        reach a number that has never messaged the business (no 24h session
-        required).
-
-        `template_params` maps template variable names to values, e.g.
-        {"name": "Rahul"}. A template with no variables (static body) is sent
-        as-is when no params are given.
-
-        The returned status is "sent" (Azure accepted the message). Actual
-        delivery (delivered/failed/read) arrives via the Azure delivery-status
-        webhook and must not be claimed here.
+        Communication Services Advanced Messaging.
         """
         if self.settings.MOCK_MODE:
             return ProviderResult(self.name, f"mock-{uuid.uuid4().hex[:12]}", "sent")
@@ -400,15 +451,6 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
         lang = language or s.whatsapp_template_language
         params = template_params or {}
 
-        self._log("Provider: Azure Communication Services")
-        self._log("From:", s.whatsapp_from or "channel-linked business number")
-        self._log("To:", to)
-        self._log("Channel ID:", s.whatsapp_channel_id)
-        self._log("Mode:", "REAL" if not s.MOCK_MODE else "MOCK")
-        self._log("Message type: TEMPLATE")
-        self._log("Template:", template_name)
-        self._log("Language:", lang)
-
         from azure.communication.messages import NotificationMessagesClient
         from azure.communication.messages.models import (
             MessageTemplate,
@@ -418,9 +460,7 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
             WhatsAppMessageTemplateBindingsComponent,
         )
 
-        # Build one binding + value per supplied parameter so templates with
-        # variables ({{1}}, {{2}}, ...) are filled in order. Without params,
-        # send the template as-is (static templates have no variables).
+        # Build one binding + value per supplied parameter
         if params:
             body_bindings = [
                 WhatsAppMessageTemplateBindingsComponent(ref_value=name) for name in params
@@ -445,25 +485,52 @@ class AzureWhatsAppProvider(_AzureMixin, NotificationProvider):
             template=template,
         )
 
-        self._log("Sending template message...")
+        logger.info(
+            "Calling Azure WhatsApp API (template): to=%s template=%s language=%s",
+            to, template_name, lang,
+            extra={"provider": self.name},
+        )
+
+        start = time.monotonic()
         try:
             client = NotificationMessagesClient.from_connection_string(self._connection_string())
             response = client.send(content)
         except Exception as exc:
+            elapsed_ms = round((time.monotonic() - start) * 1000, 1)
             msg = str(exc).lower()
+            logger.error(
+                "Azure WhatsApp template API error: error=%s duration=%.1fms",
+                exc, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             if any(k in msg for k in ("timeout", "connection", "network", "retry")):
                 raise ProviderTransientError(f"Azure WhatsApp template error: {exc}") from exc
             raise ProviderError(f"Azure WhatsApp template error: {exc}") from exc
 
+        elapsed_ms = round((time.monotonic() - start) * 1000, 1)
+
         if not response.receipts:
+            logger.error(
+                "Azure WhatsApp template returned no receipts, duration=%.1fms",
+                elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderError("Azure WhatsApp template returned no delivery receipt.")
         receipt = response.receipts[0]
         if getattr(receipt, "error", None):
-            logger.error("[WhatsApp] Azure returned an error for %s: %s", receipt.to, receipt.error)
+            logger.error(
+                "Azure WhatsApp template recipient error: to=%s error=%s duration=%.1fms",
+                receipt.to, receipt.error, elapsed_ms,
+                extra={"provider": self.name, "duration_ms": elapsed_ms},
+            )
             raise ProviderPermanentError(f"Azure WhatsApp template failed for {receipt.to}: {receipt.error}")
 
-        self._log("Azure message ID:", receipt.message_id)
-        self._log("Provider accepted message")
+        logger.info(
+            "Azure WhatsApp template API accepted message: provider_msg_id=%s status=sent duration=%.1fms",
+            receipt.message_id, elapsed_ms,
+            extra={"provider": self.name, "provider_msg_id": receipt.message_id,
+                   "duration_ms": elapsed_ms},
+        )
         return ProviderResult(self.name, receipt.message_id, "sent")
 
     def send_with_template(

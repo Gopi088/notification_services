@@ -17,6 +17,7 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
+from app.audit import record as audit_record
 from app.database import update_status_by_provider_id
 
 logger = logging.getLogger("webhooks")
@@ -139,6 +140,12 @@ async def webhook_receive(request: Request):
         status_lower = status.lower()
         if status_lower == "delivered":
             update_status_by_provider_id(provider_message_id, status="delivered")
+            audit_record(
+                action="webhook.delivery_update",
+                resource=provider_message_id,
+                outcome="success",
+                detail={"status": "delivered", "provider": "whatsapp"},
+            )
             logger.info(
                 "[WhatsApp Delivery Event] message_id=%s status=Delivered channel=whatsapp",
                 provider_message_id,
@@ -153,6 +160,12 @@ async def webhook_receive(request: Request):
                 status="failed",
                 error=f"WhatsApp delivery failed: {detail}",
             )
+            audit_record(
+                action="webhook.delivery_update",
+                resource=provider_message_id,
+                outcome="error",
+                detail={"status": "failed", "provider": "whatsapp", "error": detail},
+            )
             logger.warning(
                 "[WhatsApp Delivery Event] message_id=%s status=Failed channel=whatsapp "
                 "error_code=%s error_message=%s",
@@ -160,6 +173,12 @@ async def webhook_receive(request: Request):
             )
         elif status_lower == "read":
             update_status_by_provider_id(provider_message_id, status="delivered")
+            audit_record(
+                action="webhook.delivery_update",
+                resource=provider_message_id,
+                outcome="success",
+                detail={"status": "read", "provider": "whatsapp"},
+            )
             logger.info(
                 "[WhatsApp Delivery Event] message_id=%s status=Read channel=whatsapp",
                 provider_message_id,

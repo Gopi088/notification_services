@@ -19,11 +19,31 @@ class Settings(BaseSettings):
     MOCK_MODE: bool = True
     DATABASE_PATH: str = "notifications.db"
 
+    # --- Logging ---
+    # DEBUG, INFO, WARNING, ERROR, CRITICAL
+    LOG_LEVEL: str = "INFO"
+    # "json" for production (Docker/AWS), "plain" for local development
+    LOG_FORMAT: str = "plain"
+
     # --- Authentication ---
     # Set AUTH_ENABLED=true to require an API key on every request.
     # Clients must send the header:  X-API-Key: <AUTH_API_KEY>
     AUTH_ENABLED: bool = False
     AUTH_API_KEY: str = ""
+
+    # --- Authorization ---
+    # When AUTH_ENABLED=true, scopes are checked per API key.
+    # Scopes are stored in the api_keys table as a JSON array.
+
+    # --- Rate Limiting ---
+    RATE_LIMIT_DEFAULT_PER_SECOND: int = 10
+    RATE_LIMIT_BURST: int = 20
+
+    # --- Idempotency ---
+    IDEMPOTENCY_TTL_HOURS: int = 24
+
+    # --- Worker Resilience ---
+    WORKER_STALE_TIMEOUT_MINUTES: int = 5
 
     # --- Delivery SLA ---
     # How long (in seconds) a message may sit in "queued"/"sent" before the
@@ -35,6 +55,9 @@ class Settings(BaseSettings):
     RETRY_MAX_ATTEMPTS: int = 3
     RETRY_BACKOFF_BASE_SECONDS: float = 0.5
     RETRY_BACKOFF_MAX_SECONDS: float = 30.0
+
+    # --- Workers (asyncio queue) ---
+    WORKER_COUNT: int = 3
 
     # --- Vonage SMS (alternative SMS provider to Azure) ---
     # If VONAGE_API_KEY and VONAGE_API_SECRET are set, the SMS channel uses

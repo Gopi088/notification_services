@@ -10,6 +10,11 @@ class ErrorCode(str, Enum):
     RATE_LIMITED = "rate_limited"
     PROVIDER_ERROR = "provider_error"
     INTERNAL_ERROR = "internal_error"
+    IDEMPOTENCY_CONFLICT = "idempotency_conflict"
+    PROVIDER_TIMEOUT = "provider_timeout"
+    WORKER_UNAVAILABLE = "worker_unavailable"
+    REQUEST_CANCELLED = "request_cancelled"
+    GROUP_INCOMPLETE = "group_incomplete"
 
 
 class AppError(Exception):
@@ -65,3 +70,23 @@ class ValidationError(AppError):
 class InternalError(AppError):
     def __init__(self, message: str = "Internal server error", field: Optional[str] = None):
         super().__init__(ErrorCode.INTERNAL_ERROR, message, http_status=500, field=field)
+
+
+class IdempotencyConflictError(AppError):
+    def __init__(self, message: str = "Idempotency key conflict", field: Optional[str] = None):
+        super().__init__(ErrorCode.IDEMPOTENCY_CONFLICT, message, http_status=409, field=field)
+
+
+class ProviderTimeoutError(AppError):
+    def __init__(self, message: str = "Provider timed out", field: Optional[str] = None):
+        super().__init__(ErrorCode.PROVIDER_TIMEOUT, message, http_status=504, field=field)
+
+
+class WorkerUnavailableError(AppError):
+    def __init__(self, message: str = "Worker unavailable", field: Optional[str] = None):
+        super().__init__(ErrorCode.WORKER_UNAVAILABLE, message, http_status=503, field=field)
+
+
+class GroupIncompleteError(AppError):
+    def __init__(self, message: str = "Some channels in the group failed", field: Optional[str] = None):
+        super().__init__(ErrorCode.GROUP_INCOMPLETE, message, http_status=207, field=field)
