@@ -83,10 +83,8 @@ def test_run_retry_worker_exits_on_signal(monkeypatch):
 # ---------- migrate: PG path ----------
 
 def test_migrate_pg(monkeypatch):
-    import os
-
-    os.environ["STORAGE_BACKEND"] = "postgres"
-    os.environ["DATABASE_URL"] = "postgresql://postgres:testpass@localhost:5434/notifications"
+    monkeypatch.setenv("STORAGE_BACKEND", "postgres")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:testpass@localhost:5434/notifications")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -94,8 +92,6 @@ def test_migrate_pg(monkeypatch):
 
     n = migrate.up()
     assert n >= 0
-    os.environ["STORAGE_BACKEND"] = "sqlite"
-    os.environ["DATABASE_URL"] = ""
     get_settings.cache_clear()
 
 

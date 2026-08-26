@@ -150,7 +150,7 @@ def test_audit_file_persistence(tmp_path):
     get_settings.cache_clear()
 
 
-def test_audit_survives_restart(tmp_path):
+def test_audit_survives_restart(tmp_path, monkeypatch):
     """Audit history remains available after 'restart' (new storage instance)."""
     import os
 
@@ -158,8 +158,8 @@ def test_audit_survives_restart(tmp_path):
     from app.storage import Storage
 
     db = str(tmp_path / "audit.db")
-    os.environ["DATABASE_PATH"] = db
-    os.environ["STORAGE_BACKEND"] = "sqlite"
+    monkeypatch.setenv("DATABASE_PATH", db)
+    monkeypatch.setenv("STORAGE_BACKEND", "sqlite")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -169,7 +169,7 @@ def test_audit_survives_restart(tmp_path):
     s1.init_schema()
     import app.audit as audit_mod
 
-    audit_mod.get_storage = lambda: s1  # point audit at this storage
+    monkeypatch.setattr(audit_mod, "get_storage", lambda: s1)  # point audit at this storage
     audit_mod.record_audit(user_id="usr_a", action="notification_created",
                            notification_id="n-1", channel="whatsapp", status="queued")
     s1.close()

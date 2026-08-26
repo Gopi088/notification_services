@@ -55,6 +55,16 @@ def test_plain_formatter():
     assert "request_id=req_1" in out
 
 
+def test_plain_formatter_uses_aligned_columns():
+    from app.logging_config import PlainFormatter
+
+    record = logging.LogRecord("api.v1", logging.DEBUG, __file__, 1, "parsed", None, None)
+    out = PlainFormatter().format(record)
+    assert " | DEBUG" in out
+    assert " | api.v1" in out
+    assert out.count(" | ") >= 3
+
+
 def test_correlated_logger_injects_extra(caplog):
     from app.logging_config import CorrelatedLogger
 
@@ -78,6 +88,22 @@ def test_configure_logging_json(monkeypatch):
     os.environ["LOG_LEVEL"] = "DEBUG"
     from app.config import get_settings
 
+    get_settings.cache_clear()
+
+
+def test_configure_logging_routes_uvicorn_through_root(monkeypatch):
+    import os
+
+    os.environ["LOG_LEVEL"] = "DEBUG"
+    from app.config import get_settings
+    from app.logging_config import configure_logging
+
+    get_settings.cache_clear()
+    configure_logging()
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        configured = logging.getLogger(name)
+        assert configured.propagate is True
+        assert configured.handlers == []
     get_settings.cache_clear()
     from app.logging_config import configure_logging
 
@@ -133,6 +159,34 @@ def test_debug_mode_shows_debug(caplog):
     assert "debug line visible" in caplog.text
 
 
+def test_debug_flow_logs_are_safe_and_correlated(caplog):
+    """DEBUG flow messages include correlation fields but never message content."""
+    logger = logging.getLogger("debug-flow-test")
+    with caplog.at_level(logging.DEBUG):
+        logger.debug("send validation passed request_id=%s user_id=%s channel=%s",
+                     "req_1", "anonymous", "sms")
+    assert "send validation passed" in caplog.text
+    assert "req_1" in caplog.text
+    assert "channel=sms" in caplog.text
+
+
+def test_validation_error_logging_does_not_include_submitted_value(capsys):
+    from fastapi import Request
+    from fastapi.exceptions import RequestValidationError
+    from app.main import request_validation_error_handler
+
+    request = Request({"type": "http", "method": "POST", "path": "/send", "headers": []})
+    error = RequestValidationError([{
+        "type": "string_too_short", "loc": ("body", "message"),
+        "msg": "too short", "input": "private-message-content",
+    }])
+    response = __import__("asyncio").run(request_validation_error_handler(request, error))
+    assert response.status_code == 422
+    output = capsys.readouterr().out
+    assert "request validation failed" in output
+    assert "private-message-content" not in output
+
+
 def test_terminal_level_filter_info_only():
     """LOG_LEVEL=INFO shows only INFO records (DEBUG/WARNING/ERROR/CRITICAL hidden)."""
     import io
@@ -162,8 +216,8 @@ def test_terminal_level_filter_info_only():
     assert "hidden critical" not in out
 
 
-def test_terminal_level_filter_debug_shows_debug_and_info():
-    """LOG_LEVEL=DEBUG shows DEBUG and INFO."""
+def test_terminal_level_filter_debug_shows_all_levels():
+    """LOG_LEVEL=DEBUG shows DEBUG, INFO, WARNING, ERROR and CRITICAL."""
     import io
     import logging
 
@@ -181,12 +235,14 @@ def test_terminal_level_filter_debug_shows_debug_and_info():
     logger.info("info shown")
     logger.warning("hidden warning")
     logger.error("hidden error")
+    logger.critical("critical shown")
 
     out = captured.getvalue()
     assert "debug shown" in out
     assert "info shown" in out
-    assert "hidden warning" not in out
-    assert "hidden error" not in out
+    assert "hidden warning" in out
+    assert "hidden error" in out
+    assert "critical shown" in out
 
 
 def test_terminal_level_filter_warning_shows_warning_and_error():
@@ -345,3 +401,95 @@ def test_log_level_filter_predicate():
     assert match_error("2026-01-01 ERROR app: boom")
     assert match_error("2026-01-01 CRITICAL app: crit")
     assert not match_error("2026-01-01 INFO app: ok")
+
+
+def test_plain_formatter_colors_levels():
+    """PlainFormatter colours the level name by level."""
+    import io
+    import logging
+
+    from app.logging_config import PlainFormatter
+
+    fmt = PlainFormatter("%(levelname)s %(message)s", use_colors=True)
+
+    def _fmt(level):
+        rec = logging.LogRecord("t", level, __file__, 1, "msg", None, None)
+        return fmt.format(rec)
+
+    assert "\033[32mINFO\033[0m" in _fmt(logging.INFO)
+    assert "\033[33mWARNING\033[0m" in _fmt(logging.WARNING)
+    assert "\033[31mERROR\033[0m" in _fmt(logging.ERROR)
+    assert "\033[35m" in _fmt(logging.CRITICAL) and "\033[1m" in _fmt(logging.CRITICAL)
+    assert "\033[36mDEBUG\033[0m" in _fmt(logging.DEBUG)
+
+
+def test_plain_formatter_no_colors_when_disabled():
+    import logging
+
+    from app.logging_config import PlainFormatter
+
+    fmt = PlainFormatter("%(levelname)s %(message)s", use_colors=False)
+    rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "msg", None, None)
+    assert "\033[" not in fmt.format(rec)
+
+
+def test_cli_colorize_log_line():
+    from notification_service import _colorize_log_line
+
+    out = _colorize_log_line("2026-01-01 ERROR app: boom")
+    assert "\033[31mERROR\033[0m" in out
+    assert "boom" in out
+
+
+def test_configure_logging_terminal_colors(monkeypatch):
+    """configure_logging sets use_colors on the text stdout formatter."""
+    import os
+
+    os.environ["LOG_LEVEL"] = "INFO"
+    os.environ["LOG_FORMAT"] = "text"
+    os.environ["LOG_FILE"] = ""
+    os.environ["LOG_COLORS"] = "true"
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.logging_config import configure_logging
+
+    configure_logging()
+    root = logging.getLogger()
+    stdout_handler = next(
+        (h for h in root.handlers if isinstance(h, logging.StreamHandler)
+         and getattr(h, "baseFilename", "") == ""), None
+    )
+    assert stdout_handler is not None
+    assert getattr(stdout_handler.formatter, "use_colors", False) is True
+    logging.getLogger().handlers = []
+    get_settings.cache_clear()
+
+
+def test_file_handler_never_colored(monkeypatch, tmp_path):
+    """File handler formatter always has use_colors=False."""
+    import os
+
+    logf = str(tmp_path / "app.log")
+    os.environ["LOG_LEVEL"] = "INFO"
+    os.environ["LOG_FORMAT"] = "text"
+    os.environ["LOG_FILE"] = logf
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.logging_config import configure_logging
+
+    configure_logging()
+    root = logging.getLogger()
+    file_handler = next(
+        (h for h in root.handlers if isinstance(h, logging.handlers.RotatingFileHandler)), None
+    )
+    assert file_handler is not None
+    assert getattr(file_handler.formatter, "use_colors", True) is False
+    for h in root.handlers:
+        try:
+            h.close()
+        except Exception:
+            pass
+    logging.getLogger().handlers = []
+    get_settings.cache_clear()

@@ -103,11 +103,10 @@ def test_publish_dlq(fake_redis_client):
 # ---------- storage: PG branches ----------
 
 def test_storage_pg_full_crud(monkeypatch):
-    import os
     import uuid
 
-    os.environ["STORAGE_BACKEND"] = "postgres"
-    os.environ["DATABASE_URL"] = "postgresql://postgres:testpass@localhost:5434/notifications"
+    monkeypatch.setenv("STORAGE_BACKEND", "postgres")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://postgres:testpass@localhost:5434/notifications")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -147,8 +146,6 @@ def test_storage_pg_full_crud(monkeypatch):
     s.transition(nid, "processing", actor="t")
     assert s.get_notification(nid)["status"] == "delivered"
     s.close()
-    os.environ["STORAGE_BACKEND"] = "sqlite"
-    os.environ["DATABASE_URL"] = ""
     get_settings.cache_clear()
 
 

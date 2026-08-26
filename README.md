@@ -25,19 +25,13 @@ docker compose up
 
 ## Databases
 
-The service supports **SQLite** (local dev), **PostgreSQL** (Docker/local), and
-**CockroachDB Cloud** (wire-compatible with PostgreSQL).
+The service supports **SQLite** (local development) and **PostgreSQL**
+(Docker or production).
 
-| Backend | `STORAGE_BACKEND` | `DATABASE_BACKEND` | `DATABASE_URL` |
-| ------- | ----------------- | ------------------ | -------------- |
-| SQLite | `sqlite` | `postgres` | (unused) |
-| PostgreSQL | `postgres` | `postgres` | `postgresql://user:pass@host:5432/db` |
-| CockroachDB Cloud | `postgres` | `cockroachdb` | `postgresql://user:pass@host:26257/db?sslmode=verify-full` |
-
-For CockroachDB Cloud, also set `COCKROACH_CA_CERT` to the path of the CA
-certificate downloaded from the CockroachDB Cloud console (required for
-`sslmode=verify-full` TLS). The connection string and password are read only
-from the environment and are never logged.
+| Backend | `STORAGE_BACKEND` | `DATABASE_URL` |
+| ------- | ----------------- | -------------- |
+| SQLite | `sqlite` | (unused) |
+| PostgreSQL | `postgres` | `postgresql://user:pass@host:5432/db` |
 
 ```bash
 # Verify a database connection without printing credentials

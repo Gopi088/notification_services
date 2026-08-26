@@ -47,6 +47,21 @@ AUDIT_EVENTS = {
     "provider_failure",
     "notification_dead_lettered",
     "notification_deferred",
+    "notification_resend_requested",
+    "notification_resent",
+    "authentication_success",
+    "authentication_failed",
+    "notification_expired",
+    "retry_scheduled",
+    "retry_attempted",
+    "retry_exhausted",
+    "queue_failure",
+    "worker_failure",
+    "idempotency_duplicate",
+    "provider_webhook_received",
+    "provider_webhook_rejected",
+    "user_response_received",
+    "notification_status_queried",
 }
 
 
@@ -90,7 +105,7 @@ def record_audit(*, user_id: Optional[str], action: str,
 
     ref = mask(recipient) if recipient else None
     settings = _get_settings()
-    db_backend = getattr(settings, "DATABASE_BACKEND", "postgres") or "postgres"
+    db_backend = settings.STORAGE_BACKEND
     source = source or "notification_service"
     correlation_id = request_id or f"req_{uuid.uuid4().hex[:16]}"
     meta = dict(metadata or {})

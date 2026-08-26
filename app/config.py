@@ -20,8 +20,7 @@ class Settings(BaseSettings):
     DATABASE_PATH: str = "notifications.db"
 
     # --- Authentication ---
-    # Set AUTH_ENABLED=true to require an API key on every request.
-    # Clients must send the header:  X-API-Key: <AUTH_API_KEY>
+    # Set AUTH_ENABLED=true to require an API key on notification API routes.
     AUTH_ENABLED: bool = False
     AUTH_API_KEY: str = ""
 
@@ -40,22 +39,17 @@ class Settings(BaseSettings):
     # PostgreSQL DSN (used when STORAGE_BACKEND=postgres).
     # Example: postgresql://user:pass@localhost:5432/notifications
     DATABASE_URL: str = ""
-    # PG-compatible database engine: "postgres" (default, incl. local Docker)
-    # or "cockroachdb" (CockroachDB Cloud, wire-compatible with PostgreSQL).
-    DATABASE_BACKEND: str = "postgres"
-    # Path to the CockroachDB CA certificate (CockroachDB Cloud). Used only
-    # when DATABASE_BACKEND=cockroachdb. With sslmode=verify-full the server
-    # certificate is verified against this CA. This is the canonical name;
-    # the DSN must never carry it (we pass it as sslrootcert to psycopg2).
-    COCKROACHDB_CA_CERT_PATH: str = ""
-    DB_POOL_MIN: int = 1
-    DB_POOL_MAX: int = 10
+    DB_POOL_MIN: int = 5
+    DB_POOL_MAX: int = 50
 
     # --- Queue / Redis Streams ---
-    # If true, the API enqueues notifications to Redis Streams and workers
-    # deliver them asynchronously. If false, delivery happens in-process via
+    # If true, the API enqueues notifications to a queue and workers deliver
+    # them asynchronously. If false, delivery happens in-process via
     # BackgroundTasks (backward-compatible fallback for dev).
     QUEUE_ENABLED: bool = False
+    # Queue backend: "redis" (Redis Streams + workers, production) or
+    # "memory" (in-process asyncio queue, local single-instance dev).
+    QUEUE_BACKEND: str = "redis"
     REDIS_URL: str = "redis://localhost:6379/0"
     REDIS_PASSWORD: str = ""
     # Stream namespaces (per channel). Retry/DLQ streams are derived from these.
@@ -99,6 +93,10 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "text"  # "text" (dev) or "json" (structured)
     LOG_REDACT_KEYS: str = ""  # extra comma-separated field names to redact
+    # When true (default) and LOG_FORMAT=text, terminal logs are ANSI-coloured
+    # by level (DEBUG cyan, INFO green, WARNING yellow, ERROR red, CRITICAL
+    # magenta+bold). File logs are never coloured.
+    LOG_COLORS: bool = True
     # Optional independent file level (standard threshold semantics). When
     # empty, the file handler uses LOG_LEVEL (but unlike the terminal, it does
     # not apply the exact-level filter, so WARNING/ERROR are still written to

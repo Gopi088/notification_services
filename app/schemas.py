@@ -19,15 +19,20 @@ class Channel(str, Enum):
 # Internally we may add channels (telegram, push, ...) without touching the
 # public v1 enum above. Channels are validated at the API layer.
 class Status(str, Enum):
+    created = "created"
     queued = "queued"
     processing = "processing"
     submitted = "submitted"
     retrying = "retrying"
     sent = "sent"
     delivered = "delivered"
+    read = "read"
+    acknowledged = "acknowledged"
     failed = "failed"
     dead_lettered = "dead_lettered"
     cancelled = "cancelled"
+    scheduled = "scheduled"
+    expired = "expired"
     partial = "partial"
 
 
@@ -76,6 +81,9 @@ class SendRequest(BaseModel):
     reference: Optional[str] = Field(
         None, max_length=128, description="Caller-supplied reference, e.g. an order id"
     )
+    # Explicit resend: when true and the idempotency key already exists, create
+    # a NEW notification linked to the original instead of blocking.
+    resend: bool = False
 
     @field_validator("message")
     @classmethod
@@ -128,6 +136,10 @@ class ChannelStatus(BaseModel):
     # True when still queued/sent and elapsed_seconds > delivery_timeout_seconds.
     timed_out: bool = False
     delivery_timeout_seconds: Optional[int] = None
+    # Acknowledgement (user response) fields.
+    read_at: Optional[str] = None
+    acknowledged_at: Optional[str] = None
+    acknowledgement_type: Optional[str] = None
 
 
 class StatusResponse(BaseModel):

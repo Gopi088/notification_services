@@ -53,7 +53,9 @@ def check_redis(key: str) -> Optional[str]:
     """Return the stored notification_id for a key, or None (fast path)."""
     try:
         r = _redis()
-        return r.get(f"idem:{key}")
+        notification_id = r.get(f"idem:{key}")
+        logger.debug("idempotency redis lookup hit=%s", notification_id is not None)
+        return notification_id
     except Exception as exc:  # noqa: BLE001 - fail open to DB path
         logger.warning("idempotency redis check failed: %s", exc)
         return None
@@ -65,6 +67,33 @@ def store_redis(key: str, notification_id: str) -> None:
         r.set(f"idem:{key}", notification_id, ex=get_settings().IDEMPOTENCY_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.warning("idempotency redis store failed: %s", exc)
+
+
+def claim_idempotency_key(key: str, notification_id: str, payload_hash: str) -> bool:
+    """Atomically claim an idempotency key. Returns True if this caller won
+    the claim (first to insert with this key). False if the key already exists
+    (another caller or a previous request claimed it). The DB unique constraint
+    `idempotency_keys.key` is the concurrency mutex.
+
+    Transient SQLite lock errors are retried a few times so the winner's commit
+    settles; only a genuine unique-constraint violation returns False.
+
+    Must be called with the `notification_id` (message_id) that will be used
+    for the notification, so a replay can return the correct result.
+    """
+    import time as _time
+
+    from app.storage import get_storage
+
+    storage = get_storage()
+    logger.debug("idempotency durable claim started notification_id=%s", notification_id)
+    for _ in range(8):
+        try:
+            return storage.store_idempotency_key(key, notification_id, payload_hash)
+        except Exception:  # noqa: BLE001 - lock contention; retry briefly
+            _time.sleep(0.01)
+    # Last attempt - propagate a genuine error.
+    return storage.store_idempotency_key(key, notification_id, payload_hash)
 
 
 def check_durable(key: str, payload_hash: str) -> Tuple[Optional[str], bool]:
@@ -85,7 +114,6 @@ def check_durable(key: str, payload_hash: str) -> Tuple[Optional[str], bool]:
     notification_id = str(uuid.uuid4())
     stored = storage.store_idempotency_key(key, notification_id, payload_hash)
     if not stored:
-        # concurrent insert lost; re-read
         again = storage.find_idempotency_key_row(key)
         return (again.get("notification_id") if again else None), False
     return notification_id, True

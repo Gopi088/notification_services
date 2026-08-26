@@ -40,6 +40,7 @@ def _redis():
 def _check(key: str, limit: int, window_seconds: int) -> RateLimitResult:
     """Fixed-window counter. Returns allowed + remaining/reset."""
     if not get_settings().RATELIMIT_ENABLED or limit <= 0:
+        logger.debug("rate limit bypassed enabled=false")
         return RateLimitResult(True, limit, limit, 0)
     try:
         r = _redis()
@@ -49,6 +50,7 @@ def _check(key: str, limit: int, window_seconds: int) -> RateLimitResult:
         ttl = max(0, r.ttl(key))
         remaining = max(0, limit - current)
         allowed = current <= limit
+        logger.debug("rate limit evaluated allowed=%s remaining=%d", allowed, remaining)
         if not allowed:
             logger.warning(
                 "rate limit exceeded key=%s limit=%d current=%d", key, limit, current

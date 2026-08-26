@@ -107,6 +107,7 @@ async def webhook_validate(request: Request):
 async def webhook_receive(request: Request):
     body = await request.json()
     events = body if isinstance(body, list) else [body]
+    logger.debug("webhook request parsed event_count=%d", len(events))
 
     for event in events:
         event_type = event.get("eventType", "")
@@ -134,6 +135,8 @@ async def webhook_receive(request: Request):
         status = data.get("status")
         if not provider_message_id or not status:
             continue
+        logger.debug("webhook delivery received notification_id=%s channel=whatsapp status=%s",
+                     provider_message_id, status.lower())
 
         # Log the full event safely for debugging
         _log_event_safe(event)
@@ -206,4 +209,5 @@ async def webhook_receive(request: Request):
                 provider_message_id, status,
             )
 
+    logger.debug("webhook response status=ok event_count=%d", len(events))
     return JSONResponse({"status": "ok"})

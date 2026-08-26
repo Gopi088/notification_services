@@ -30,8 +30,8 @@ def test_config_properties():
 def test_factory_sms_prefers_vonage(monkeypatch):
     import os
 
-    os.environ["VONAGE_API_KEY"] = "k"
-    os.environ["VONAGE_API_SECRET"] = "s"
+    monkeypatch.setenv("VONAGE_API_KEY", "k")
+    monkeypatch.setenv("VONAGE_API_SECRET", "s")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -46,8 +46,8 @@ def test_factory_sms_prefers_vonage(monkeypatch):
 def test_factory_sms_falls_back_to_azure(monkeypatch):
     import os
 
-    os.environ["VONAGE_API_KEY"] = ""
-    os.environ["VONAGE_API_SECRET"] = ""
+    monkeypatch.setenv("VONAGE_API_KEY", "")
+    monkeypatch.setenv("VONAGE_API_SECRET", "")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -63,8 +63,8 @@ def test_factory_whatsapp_prefers_vonage(monkeypatch):
     import os
 
     os.environ["VONAGE_WHATSAPP_FROM"] = "14157386102"
-    os.environ["VONAGE_API_KEY"] = "k"
-    os.environ["VONAGE_API_SECRET"] = "s"
+    monkeypatch.setenv("VONAGE_API_KEY", "k")
+    monkeypatch.setenv("VONAGE_API_SECRET", "s")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -79,9 +79,9 @@ def test_factory_whatsapp_prefers_vonage(monkeypatch):
 def test_factory_email_is_azure(monkeypatch):
     import os
 
-    os.environ["VONAGE_API_KEY"] = ""
-    os.environ["VONAGE_WHATSAPP_FROM"] = ""
-    os.environ["VONAGE_API_SECRET"] = ""
+    monkeypatch.setenv("VONAGE_API_KEY", "")
+    monkeypatch.setenv("VONAGE_WHATSAPP_FROM", "")
+    monkeypatch.setenv("VONAGE_API_SECRET", "")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -133,3 +133,53 @@ def test_webhook_missing_message_id_ignored(client):
                     json=[{"data": {"channelType": "whatsapp", "status": "delivered"},
                            "eventType": "Microsoft.Communication.AdvancedMessageDeliveryStatusUpdated"}])
     assert r.status_code == 200
+
+
+def test_main_exception_handler_classified_provider(client):
+    """Provider errors outside the worker are classified to typed errors."""
+    from unittest.mock import MagicMock
+
+    from app.main import unhandled_exception_handler
+    from app.providers.base import ProviderError
+
+    req = MagicMock()
+    req.url.path = "/test"
+
+    # Retryable provider error → 502
+    resp = unhandled_exception_handler(req, ProviderError("down", retryable=True))
+    assert resp.status_code == 502
+
+    # Non-retryable provider error → 400
+    resp = unhandled_exception_handler(req, ProviderError("bad recipient", retryable=False))
+    assert resp.status_code == 400
+
+    # Unknown exception → 500
+    resp = unhandled_exception_handler(req, RuntimeError("boom"))
+    assert resp.status_code == 500
+
+
+def test_memory_queue_run_error_does_not_kill_loop():
+    """Memory queue worker survives a callback exception."""
+    import asyncio
+
+    from app.memory_queue import MemoryQueue
+
+    seen = []
+
+    async def run():
+        q = MemoryQueue()
+
+        async def cb(channel, payload):
+            seen.append(payload["notification_id"])
+            raise RuntimeError("boom")  # should be caught
+
+        q = MemoryQueue(worker_callback=cb)
+        q.start()
+        q.publish("sms", "n-1", "g", "+919887270348", attempt=1)
+        await asyncio.sleep(0.05)
+        q.publish("sms", "n-2", "g", "+919887270348", attempt=1)
+        await asyncio.sleep(0.05)
+        q.stop()
+
+    asyncio.run(run())
+    assert seen  # both processed despite the error

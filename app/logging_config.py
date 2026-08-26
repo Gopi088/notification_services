@@ -62,7 +62,7 @@ class TerminalLevelFilter(logging.Filter):
     (DEBUG/WARNING/ERROR/CRITICAL are hidden). Other levels behave per the
     documented mapping:
 
-      LOG_LEVEL=DEBUG    -> DEBUG + INFO
+      LOG_LEVEL=DEBUG    -> DEBUG + INFO + WARNING + ERROR + CRITICAL
       LOG_LEVEL=INFO     -> INFO only
       LOG_LEVEL=WARNING  -> WARNING + ERROR
       LOG_LEVEL=ERROR    -> ERROR + CRITICAL
@@ -75,7 +75,10 @@ class TerminalLevelFilter(logging.Filter):
     """
 
     _ALLOWED: dict = {
-        logging.DEBUG: {logging.DEBUG, logging.INFO},
+        logging.DEBUG: {
+            logging.DEBUG, logging.INFO, logging.WARNING,
+            logging.ERROR, logging.CRITICAL,
+        },
         logging.INFO: {logging.INFO},
         logging.WARNING: {logging.WARNING, logging.ERROR},
         logging.ERROR: {logging.ERROR, logging.CRITICAL},
@@ -117,10 +120,36 @@ class StructuredFormatter(logging.Formatter):
 
 
 class PlainFormatter(logging.Formatter):
-    """Human-readable text formatter for terminals (LOG_FORMAT=text)."""
+    """Human-readable text formatter for terminals (LOG_FORMAT=text).
+
+    When `use_colors=True` (default for TTY terminals) the level name is
+    ANSI-coloured: DEBUG=blue, INFO=green, WARNING=yellow, ERROR=red,
+    CRITICAL=magenta+bold.
+    """
+
+    _COLORS = {
+        "DEBUG": "\033[36m",       # cyan
+        "INFO": "\033[32m",        # green
+        "WARNING": "\033[33m",     # yellow
+        "ERROR": "\033[31m",       # red
+        "CRITICAL": "\033[35m\033[1m",  # magenta + bold
+    }
+    _RESET = "\033[0m"
+
+    def __init__(self, fmt: Optional[str] = None, use_colors: bool = False):
+        # Fixed-width columns make mixed DEBUG/INFO/ERROR terminal output easy
+        # to scan without changing handlers, files, or audit persistence.
+        super().__init__(fmt or "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s")
+        self.use_colors = use_colors
 
     def format(self, record: logging.LogRecord) -> str:
         base = super().format(record)
+        if self.use_colors:
+            color = self._COLORS.get(record.levelname, "")
+            if color:
+                # Replace the fixed-width level field with a coloured value.
+                colored = f"{color}{record.levelname}{self._RESET}"
+                base = base.replace(record.levelname, colored, 1)
         extra = getattr(record, "extra", None)
         if isinstance(extra, dict):
             for k, v in extra.items():
@@ -144,10 +173,14 @@ def configure_logging() -> None:
     settings = get_settings()
     level = getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO)
     fmt = settings.LOG_FORMAT.lower()
-
-    formatter = StructuredFormatter() if fmt == "json" else PlainFormatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s"
+    use_colors = fmt == "text" and (
+        getattr(settings, "LOG_COLORS", True) or sys.stdout.isatty()
     )
+
+    if fmt == "json":
+        formatter = StructuredFormatter()
+    else:
+        formatter = PlainFormatter(use_colors=use_colors)
 
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)  # allow everything upstream; handlers filter
@@ -158,6 +191,15 @@ def configure_logging() -> None:
     stdout.setFormatter(formatter)
     stdout.addFilter(TerminalLevelFilter(level))
     root.addHandler(stdout)
+
+    # Uvicorn installs separate handlers before importing the application.
+    # Route its startup/error/access records through the application root
+    # handler so every terminal line uses the same aligned column layout.
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        uvicorn_logger = logging.getLogger(logger_name)
+        uvicorn_logger.handlers = []
+        uvicorn_logger.propagate = True
+        uvicorn_logger.setLevel(logging.NOTSET)
 
     log_file = getattr(settings, "LOG_FILE", "") or ""
     if log_file:
@@ -170,9 +212,9 @@ def configure_logging() -> None:
             rotating = logging.handlers.RotatingFileHandler(
                 log_file, maxBytes=max_bytes, backupCount=backups, encoding="utf-8"
             )
-            rotating.setFormatter(formatter)
-            # File handler keeps standard threshold semantics (independent of
-            # the terminal's exact-level filter).
+            # File handler: no colors, standard threshold, independent filter.
+            file_formatter = PlainFormatter(use_colors=False)
+            rotating.setFormatter(file_formatter)
             file_level = getattr(settings, "LOG_FILE_LEVEL", "") or ""
             if file_level:
                 rotating.setLevel(getattr(logging, file_level.upper(), level))

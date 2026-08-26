@@ -42,6 +42,8 @@ def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., Provide
     from app.audit import record_audit
 
     storage.transition(notification_id, PROCESSING, actor="orchestrator")
+    logger.debug("delivery started notification_id=%s channel=%s status=processing",
+                 notification_id, channel.value)
     try:
         result = fn()
     except ProviderError as exc:
@@ -76,6 +78,8 @@ def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., Provide
         provider_message_id=result.provider_message_id,
         actor="orchestrator",
     )
+    logger.debug("provider accepted notification_id=%s channel=%s status=submitted provider=%s",
+                 notification_id, channel.value, result.provider_name)
     row = storage.get_notification(notification_id)
     record_audit(
         user_id=row.get("created_by") if row else None,
@@ -129,17 +133,25 @@ def _send_one(
 def _dispatch(notification_id: str, channel: Channel, cr, message: str,
               params: Optional[Dict], group_id: str, reference: Optional[str],
               background_tasks) -> None:
-    """Dispatch one channel either to the queue (async) or in-process (fallback)."""
+    """Dispatch one channel to the configured queue backend (or in-process)."""
     settings = get_settings()
     if settings.QUEUE_ENABLED:
-        from app import queue as q
-
         recipient = cr.contact
-        q.publish(channel.value, notification_id, group_id, recipient, attempt=1)
+        if settings.QUEUE_BACKEND == "memory":
+            from app.memory_queue import get_memory_queue
+
+            get_memory_queue().publish(channel.value, notification_id, group_id,
+                                       recipient, attempt=1)
+        else:
+            from app import queue as q
+
+            q.publish(channel.value, notification_id, group_id, recipient, attempt=1)
         logger.info(
-            "notification queued notification_id=%s channel=%s group_id=%s",
-            notification_id, channel.value, group_id,
+            "notification queued notification_id=%s channel=%s group_id=%s backend=%s",
+            notification_id, channel.value, group_id, settings.QUEUE_BACKEND,
         )
+        logger.debug("queue dispatch complete notification_id=%s channel=%s group_id=%s backend=%s",
+                     notification_id, channel.value, group_id, settings.QUEUE_BACKEND)
     else:
         background_tasks.add_task(
             _send_one,
@@ -151,24 +163,35 @@ def _dispatch(notification_id: str, channel: Channel, cr, message: str,
             cr.template_language,
             params,
         )
+        logger.debug("background dispatch scheduled notification_id=%s channel=%s group_id=%s",
+                     notification_id, channel.value, group_id)
 
 
-def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
+def orchestrate_send(req: SendRequest, background_tasks, message_ids: Optional[List[str]] = None,
+                   parent_notification_id: Optional[str] = None) -> Dict:
     """
     Queue each channel of `req` under one group_id and dispatch delivery.
 
     QUEUE_ENABLED=true  → publish to Redis Streams (workers deliver).
     QUEUE_ENABLED=false → BackgroundTasks (backward compatible).
 
+    `message_ids`, when provided, pre-assigns the public message_id per
+    channel (used for durable idempotency claims before creation).
+    `parent_notification_id`, when provided, links this send as a resend of
+    the original notification.
+
     Returns the group-level summary used for the 202 response.
     """
     storage = get_storage()
     settings = get_settings()
     group_id = str(uuid.uuid4())
+    logger.debug("orchestration started request_id=%s user_id=%s notification_id=%s channel_count=%d",
+                 getattr(req, "_request_id", None), getattr(req, "_user_id", None), group_id,
+                 len(req.channels))
     queued: List[Dict] = []
 
-    for cr in req.channels:
-        notification_id = str(uuid.uuid4())
+    for idx, cr in enumerate(req.channels):
+        notification_id = message_ids[idx] if message_ids and idx < len(message_ids) else str(uuid.uuid4())
         params = {p.name: p.value for p in cr.template_params} if cr.template_params else None
         internal_id = storage.create_notification(
             message_id=notification_id,
@@ -184,7 +207,12 @@ def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
             request_id=getattr(req, "_request_id", None),
             created_by=getattr(req, "_user_id", None),
             max_attempts=settings.MAX_ATTEMPTS,
+            parent_notification_id=parent_notification_id,
+            resend_count=1 if parent_notification_id else 0,
         )
+        logger.debug("database notification created request_id=%s user_id=%s notification_id=%s channel=%s status=queued",
+                     getattr(req, "_request_id", None), getattr(req, "_user_id", None),
+                     notification_id, cr.channel.value)
         from app.audit import record_audit
         record_audit(
             user_id=getattr(req, "_user_id", None),
@@ -275,9 +303,15 @@ def orchestrate_event(req: NotificationEventRequest, background_tasks) -> Dict:
             "contact": contact,
         })
         if settings.QUEUE_ENABLED:
-            from app import queue as q
+            if settings.QUEUE_BACKEND == "memory":
+                from app.memory_queue import get_memory_queue
 
-            q.publish(delivery.channel.value, internal_id, group_id, contact, attempt=1)
+                get_memory_queue().publish(delivery.channel.value, internal_id, group_id,
+                                           contact, attempt=1)
+            else:
+                from app import queue as q
+
+                q.publish(delivery.channel.value, internal_id, group_id, contact, attempt=1)
             logger.info("notification queued notification_id=%s channel=%s", notification_id, delivery.channel.value)
         else:
             background_tasks.add_task(
@@ -330,6 +364,7 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
     """Aggregate per-channel statuses for one group into a public summary."""
     storage = get_storage()
     rows = storage.get_group(group_id)
+    logger.debug("status group lookup notification_id=%s found=%s", group_id, bool(rows))
     if not rows:
         return None
 
@@ -348,6 +383,9 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
             "error": row.get("last_error"),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+            "read_at": row.get("read_at"),
+            "acknowledged_at": row.get("acknowledged_at"),
+            "acknowledgement_type": row.get("acknowledgement_type"),
             **detail,
         })
 
@@ -369,6 +407,7 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
 def get_message_summary(message_id: str) -> Optional[Dict]:
     storage = get_storage()
     row = storage.get_notification_by_message_id(message_id)
+    logger.debug("status message lookup notification_id=%s found=%s", message_id, row is not None)
     if row is None:
         return None
     detail = _delivery_detail(row)
@@ -383,5 +422,8 @@ def get_message_summary(message_id: str) -> Optional[Dict]:
         "error": row.get("last_error"),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "read_at": row.get("read_at"),
+        "acknowledged_at": row.get("acknowledged_at"),
+        "acknowledgement_type": row.get("acknowledgement_type"),
         **detail,
     }

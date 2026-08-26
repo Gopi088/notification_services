@@ -46,6 +46,7 @@ def process_message(channel: str, payload: Dict) -> bool:
     storage = get_storage()
     notification_id = payload.get("notification_id")
     attempt = int(payload.get("attempt", 1))
+    logger.debug("worker received notification_id=%s channel=%s attempt=%d", notification_id, channel, attempt)
 
     notification = storage.get_notification(notification_id)
     if notification is None:
@@ -79,6 +80,7 @@ def process_message(channel: str, payload: Dict) -> bool:
     )
     if updated is None:
         return True
+    logger.debug("worker processing notification_id=%s channel=%s status=processing", notification_id, channel)
 
     provider = None
     started = time.monotonic()
@@ -118,6 +120,8 @@ def process_message(channel: str, payload: Dict) -> bool:
                 template_params=params,
             )
         else:
+            logger.debug("worker provider send starting notification_id=%s channel=%s provider=%s",
+                         notification_id, channel, provider.name)
             result = provider.send(recipient, message)
 
         duration_ms = int((time.monotonic() - started) * 1000)
@@ -137,6 +141,8 @@ def process_message(channel: str, payload: Dict) -> bool:
             notification_id, notification.get("group_id"), result.provider_name,
             result.provider_message_id, attempt, duration_ms,
         )
+        logger.debug("worker response ready notification_id=%s channel=%s status=submitted",
+                     notification_id, channel)
         record_audit(
             user_id=notification.get("created_by"),
             action="notification_sent", notification_id=notification_id,
@@ -171,6 +177,8 @@ def process_message(channel: str, payload: Dict) -> bool:
                 "worker retry scheduled notification_id=%s group_id=%s attempt=%d delay_ms=%d",
                 notification_id, notification.get("group_id"), attempt + 1, delay,
             )
+            logger.debug("worker retry queued notification_id=%s channel=%s status=retrying attempt=%d",
+                         notification_id, channel, attempt + 1)
             record_audit(
                 user_id=notification.get("created_by"),
                 action="notification_retrying", notification_id=notification_id,

@@ -8,15 +8,12 @@ production data, or real Redis/PostgreSQL unless explicitly overridden.
 import os
 import tempfile
 
-# Force the test environment so `.env` can never leak real CockroachDB
-# credentials / STORAGE_BACKEND into the pytest run. Direct assignment
-# (not setdefault) guarantees the suite always uses SQLite + local Postgres
-# unless an individual test overrides via monkeypatch.
+# Force the test environment so `.env` can never leak production settings
+# into the pytest run. Direct assignment (not setdefault) guarantees the suite
+# always uses SQLite unless an individual test overrides via monkeypatch.
 os.environ["MOCK_MODE"] = "true"
 os.environ["STORAGE_BACKEND"] = "sqlite"
-os.environ["DATABASE_BACKEND"] = "postgres"
 os.environ["DATABASE_URL"] = ""
-os.environ["COCKROACHDB_CA_CERT_PATH"] = ""
 os.environ["QUEUE_ENABLED"] = "false"
 os.environ["RATELIMIT_ENABLED"] = "false"
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
@@ -44,14 +41,18 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture()
-def client():
-    """FastAPI TestClient with fresh storage."""
+def client(tmp_path):
+    """FastAPI TestClient with a fresh isolated DB."""
+    import os
+
     from fastapi.testclient import TestClient
 
     from app.config import get_settings
     from app.main import app
     from app.storage import get_storage, reset_storage
 
+    db = str(tmp_path / "test.db")
+    os.environ["DATABASE_PATH"] = db
     get_settings.cache_clear()
     reset_storage()
     get_storage()
@@ -61,11 +62,15 @@ def client():
 
 
 @pytest.fixture()
-def storage():
-    """Storage instance (SQLite test DB)."""
+def storage(tmp_path):
+    """Storage instance (isolated SQLite test DB)."""
+    import os
+
     from app.config import get_settings
     from app.storage import get_storage, reset_storage
 
+    db = str(tmp_path / "storage.db")
+    os.environ["DATABASE_PATH"] = db
     get_settings.cache_clear()
     reset_storage()
     s = get_storage()

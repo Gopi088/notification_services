@@ -127,3 +127,84 @@ def test_transitions_table_consistency():
     assert DELIVERED not in TRANSITIONS[DELIVERED]
     assert CANCELLED not in TRANSITIONS[CANCELLED]
     assert DEAD_LETTERED not in TRANSITIONS[DEAD_LETTERED]
+
+
+def test_mark_read_transition(storage):
+    """delivered -> read via mark_read."""
+    nid = storage.create_notification(
+        message_id="read-1", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="delivered",
+    )
+    row = storage.mark_read(nid)
+    assert row is not None
+    assert row["status"] == "read"
+    assert row["read_at"] is not None
+
+
+def test_mark_acknowledged_from_delivered(storage):
+    """delivered -> acknowledged stores acknowledgement metadata."""
+    nid = storage.create_notification(
+        message_id="ack-1", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="delivered",
+    )
+    row = storage.mark_acknowledged(nid, ack_type="reply", ack_message="YES",
+                                    ack_source="inbound_whatsapp")
+    assert row is not None
+    assert row["status"] == "acknowledged"
+    assert row["acknowledgement_type"] == "reply"
+    assert row["acknowledgement_message"] == "YES"
+    assert row["acknowledged_at"] is not None
+
+
+def test_mark_acknowledged_from_read(storage):
+    """read -> acknowledged."""
+    nid = storage.create_notification(
+        message_id="ack-2", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="read",
+    )
+    row = storage.mark_acknowledged(nid, ack_type="button")
+    assert row["status"] == "acknowledged"
+
+
+def test_mark_acknowledged_invalid_from_queued(storage):
+    """queued -> acknowledged is rejected (invalid transition)."""
+    nid = storage.create_notification(
+        message_id="ack-3", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="queued",
+    )
+    row = storage.mark_acknowledged(nid)
+    assert row["status"] == "queued"  # unchanged
+
+
+def test_transition_sets_read_at_and_acknowledged_at(storage):
+    """transition() sets timestamps when entering read/acknowledged."""
+    nid = storage.create_notification(
+        message_id="ts-1", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="submitted",
+    )
+    r1 = storage.transition(nid, "read", actor="webhook")
+    assert r1["status"] == "read"
+    assert r1["read_at"] is not None
+    assert r1["acknowledged_at"] is None
+    r2 = storage.transition(nid, "acknowledged", actor="webhook")
+    assert r2["status"] == "acknowledged"
+    assert r2["acknowledged_at"] is not None
+
+
+def test_submitted_to_expired(storage):
+    """submitted -> expired is legal."""
+    nid = storage.create_notification(
+        message_id="exp-1", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="submitted",
+    )
+    row = storage.transition(nid, "expired", actor="system")
+    assert row["status"] == "expired"
+
+
+def test_queued_to_expired(storage):
+    nid = storage.create_notification(
+        message_id="exp-2", channel="whatsapp", recipient="+919887270348",
+        message="hi", status="queued",
+    )
+    row = storage.transition(nid, "expired", actor="system")
+    assert row["status"] == "expired"

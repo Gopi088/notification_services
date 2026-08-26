@@ -17,8 +17,6 @@ Notification Service CLI - run it like any Linux command.
   python3 notification_service.py db-check
 
 The server is started automatically if it isn't running.
-When AUTH_ENABLED=true in .env, the CLI uses the same AUTH_API_KEY setting
-for authentication (single source of truth). No separate key is needed.
 """
 import json
 import logging
@@ -112,6 +110,32 @@ def http(method: str, path: str, payload: dict | None = None):
             except urllib.error.HTTPError as exc2:
                 return exc2.code, _json_detail(exc2)
         return exc.code, _json_detail(exc)
+
+
+def http_full(method: str, path: str, payload: dict | None = None):
+    """Like http() but returns (status, headers, body)."""
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    key = API_KEY
+    if _SERVER_REQUIRES_AUTH and not key:
+        key = _ensure_api_key()
+    if key:
+        headers["X-API-Key"] = key
+    req = urllib.request.Request(BASE_URL + path, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, dict(resp.headers), json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and not API_KEY and _SERVER_REQUIRES_AUTH:
+            key = _ensure_api_key()
+            headers["X-API-Key"] = key
+            req2 = urllib.request.Request(BASE_URL + path, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(req2, timeout=5) as resp:
+                    return resp.status, dict(resp.headers), json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc2:
+                return exc2.code, {}, _json_detail(exc2)
+        return exc.code, dict(exc.headers), _json_detail(exc)
 
 
 def server_up() -> bool:
@@ -316,7 +340,23 @@ def _print_recent_logs(lines: int = 8, delay: float = 3.0,
 def do_send_entries(entries: list, message: str) -> None:
     """POST pre-built channel entries (each with its own channel/contact/template)."""
     payload = {"channels": entries, "message": message}
-    code, body = http("POST", "/api/v1/notifications/send", payload)
+    code, resp_headers, body = http_full("POST", "/api/v1/notifications/send", payload)
+
+    # Duplicate detected: ask the user whether to resend.
+    if resp_headers.get("X-Idempotent-Replay", "").lower() == "true":
+        print("Notification already sent.")
+        try:
+            answer = input("Do you want to resend? (y/n): ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer == "y":
+            payload["resend"] = True
+            code, resp_headers, body = http_full("POST", "/api/v1/notifications/send", payload)
+        else:
+            # Return the existing notification status.
+            if body.get("message_id"):
+                print(f"Returning existing notification: {body['message_id']} (status: {body.get('status')})")
+                return
     if code != 202 or not body.get("message_id"):
         detail = body.get("error", body.get("detail", body))
         if isinstance(detail, dict):
@@ -582,7 +622,7 @@ def main() -> None:
 def do_db_check() -> None:
     """Check the configured database connection without exposing credentials.
 
-    Reports: backend, engine, host, connectivity. Never prints DATABASE_URL.
+    Reports: backend, host, connectivity. Never prints DATABASE_URL.
     """
     try:
         from app.config import get_settings
@@ -593,10 +633,7 @@ def do_db_check() -> None:
         storage = Storage()
         host = storage._safe_host()
         backend = storage.backend
-        engine = getattr(s, "DATABASE_BACKEND", "postgres") or "postgres"
-        ca = getattr(s, "COCKROACHDB_CA_CERT_PATH", "") or ""
         print(f"Database backend : {backend}")
-        print(f"Database engine  : {engine}")
         print(f"Database host    : {host}")
         if backend == "sqlite":
             print(f"SQLite path      : {s.DATABASE_PATH}")
@@ -605,12 +642,6 @@ def do_db_check() -> None:
             print("Status           : OK" if os.path.exists(s.DATABASE_PATH)
                   else "Status           : file not found yet")
             return
-        if engine == "cockroachdb":
-            if not ca:
-                print("CA cert path     : NOT SET")
-                print("Status           : FAILED (COCKROACHDB_CA_CERT_PATH is required)")
-                sys.exit(1)
-            print(f"CA cert path     : {ca}")
         storage.connect()
         storage.close()
         print("Status           : OK")
@@ -680,6 +711,27 @@ def do_audit(rest: list) -> None:
             f"notif={r.get('notification_id','-')[:8]} channel={r.get('channel','-')} "
             f"status={r.get('status','-')} result={r.get('result','-')}"
         )
+
+
+_LOG_COLORS = {
+    "DEBUG": "[36m",
+    "INFO": "[32m",
+    "WARNING": "[33m",
+    "ERROR": "[31m",
+    "CRITICAL": "[35m[1m",
+}
+_LOG_RESET = "[0m"
+
+
+def _colorize_log_line(line: str) -> str:
+    """Add ANSI colour to the level token in a log line."""
+    for tok, code in _LOG_COLORS.items():
+        needle = f" {tok} "
+        if needle in line:
+            return line.replace(needle, f" {code}{tok}{_LOG_RESET} ", 1)
+        if line.startswith(tok + " "):
+            return line.replace(tok, f"{code}{tok}{_LOG_RESET}", 1)
+    return line
 
 
 def _log_level_filter(level: int) -> callable:
@@ -752,7 +804,7 @@ def do_logs() -> None:
                     line = fh.readline()
                     if line:
                         if matcher(line):
-                            print(line, end="")
+                            print(_colorize_log_line(line), end="")
                     else:
                         time.sleep(0.5)
         else:
@@ -760,7 +812,7 @@ def do_logs() -> None:
                 lines = fh.readlines()
             for line in lines[-50:]:
                 if matcher(line):
-                    print(line, end="")
+                    print(_colorize_log_line(line), end="")
     except KeyboardInterrupt:
         return
 

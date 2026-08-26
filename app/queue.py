@@ -75,6 +75,8 @@ def publish(channel: str, notification_id: str, group_id: Optional[str],
             "queue publish channel=%s notification_id=%s group_id=%s entry=%s",
             channel, notification_id, group_id, entry_id,
         )
+        logger.debug("queue message published notification_id=%s channel=%s attempt=%d",
+                     notification_id, channel, attempt)
         return entry_id
     except Exception as exc:  # noqa: BLE001
         logger.error("queue publish failed channel=%s notification_id=%s: %s",
@@ -95,6 +97,8 @@ def publish_retry(channel: str, notification_id: str, group_id: Optional[str],
             "queue retry scheduled channel=%s notification_id=%s attempt=%d scheduled_at=%.2f",
             channel, notification_id, attempt, scheduled_at,
         )
+        logger.debug("retry queue message published notification_id=%s channel=%s attempt=%d",
+                     notification_id, channel, attempt)
         return entry_id
     except Exception as exc:  # noqa: BLE001
         logger.error("queue retry publish failed notification_id=%s: %s", notification_id, exc)

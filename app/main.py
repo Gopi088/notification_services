@@ -6,11 +6,13 @@ all routers, and exposes liveness/readiness/health endpoints.
 """
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.config import get_settings
+from app.auth import require_api_key
 from app.logging_config import configure_logging
 from app.routers.notifications import router as legacy_router
 from app.routers.v1 import router as v1_router
@@ -36,14 +38,12 @@ def on_startup() -> None:
                 __version__, settings.MOCK_MODE, settings.STORAGE_BACKEND, settings.QUEUE_ENABLED)
     # Initialize durable storage (source of truth) + schema.
     get_storage()
-    # Run migrations exactly once per startup. PostgreSQL migrations are
-    # advisory-locked + idempotent, so concurrent containers (api + workers)
-    # never race on CREATE TABLE (no pg_type_typname_nsp_index errors).
-    if settings.STORAGE_BACKEND in ("postgres", "cockroachdb"):
-        from app.migrate import up as run_migrations
+    # Run migrations on every backend. This upgrades an existing local SQLite
+    # database before requests use columns added by newer application versions.
+    from app.migrate import up as run_migrations
 
-        n = run_migrations()
-        logger.info("migrations applied this startup: %s", n)
+    n = run_migrations()
+    logger.info("migrations applied this startup: %s", n)
     # Keep legacy SQLite table available for backward-compatible tooling.
     try:
         from app.database import init_db
@@ -60,6 +60,33 @@ def on_shutdown() -> None:
 
     reset_storage()
     logger.info("application shutdown complete")
+
+
+@app.exception_handler(RequestValidationError)
+async def request_validation_error_handler(
+    request: Request, exc: RequestValidationError,
+) -> JSONResponse:
+    """Log malformed requests without recording submitted values or secrets."""
+    logger.error(
+        "request validation failed method=%s path=%s status=422 error_count=%d",
+        request.method, request.url.path, len(exc.errors()),
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Log handled client errors without logging bodies, headers, or secrets."""
+    level = logger.error if exc.status_code >= 400 else logger.info
+    level(
+        "request rejected method=%s path=%s status=%d",
+        request.method, request.url.path, exc.status_code,
+    )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=exc.headers,
+    )
 
 
 @app.exception_handler(Exception)
@@ -100,9 +127,10 @@ def unhandled_exception_handler(request: Request, exc: Exception) -> JSONRespons
 
 
 # Versioned public API (recommended)
-app.include_router(v1_router)
+app.include_router(v1_router, dependencies=[Depends(require_api_key)])
 
 # Legacy unversioned routes (kept for backward compatibility)
+# Legacy `/send` and `/status` stay public for local CLI and Postman use.
 app.include_router(legacy_router)
 
 
@@ -140,7 +168,7 @@ def readiness() -> JSONResponse:
 
         # Probe storage by checking if a simple query works (connectivity check).
         s = get_storage()
-        if s.backend in ("postgres", "cockroachdb"):
+        if s.backend == "postgres":
             with s._pg() as conn, conn.cursor() as cur:
                 cur.execute("SELECT 1")
         else:
