@@ -208,3 +208,41 @@ def test_queued_to_expired(storage):
     )
     row = storage.transition(nid, "expired", actor="system")
     assert row["status"] == "expired"
+
+
+def test_find_recent_by_content_hash(storage):
+    import datetime
+
+    chash = "abc123"
+    mid = "dup-hash-1"
+    storage.create_notification(
+        message_id=mid, channel="sms", recipient="+919887270348",
+        message="hello", content_hash=chash,
+    )
+    # Within the window -> found.
+    found = storage.find_recent_by_content_hash(chash, window_minutes=30)
+    assert found is not None
+    assert found["message_id"] == mid
+    # Outside the window -> not found.
+    assert storage.find_recent_by_content_hash(chash, window_minutes=0) is None
+    # Different content hash -> not found.
+    assert storage.find_recent_by_content_hash("nope", window_minutes=30) is None
+
+
+def test_find_recent_by_content_hash_respects_window(storage):
+    import datetime
+
+    chash = "old-hash-1"
+    old_ts = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(minutes=120)).isoformat()
+    nid = storage.create_notification(
+        message_id="dup-hash-old", channel="sms", recipient="+919887270348",
+        message="hello", content_hash=chash,
+    )
+    # Backdate so the notification is older than the window.
+    with storage._sqlite() as conn:
+        conn.execute("UPDATE notifications SET created_at=? WHERE message_id=?",
+                     (old_ts, "dup-hash-old"))
+    assert storage.find_recent_by_content_hash(chash, window_minutes=30) is None
+    # A wider window sees it.
+    assert storage.find_recent_by_content_hash(chash, window_minutes=300) is not None

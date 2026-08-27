@@ -149,6 +149,49 @@ def test_migration_failure_propagates(mig_settings):
     get_settings.cache_clear()
 
 
+def test_migration_adds_content_hash_to_existing_db(mig_settings):
+    """An older DB without content_hash gets the column via migration."""
+    import sqlite3
+
+    from app import migrate
+
+    # Simulate an old database: full schema minus the content_hash column.
+    conn = sqlite3.connect(mig_settings)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+        CREATE TABLE notifications (
+            id TEXT PRIMARY KEY, message_id TEXT, group_id TEXT, channel TEXT NOT NULL,
+            recipient TEXT NOT NULL, message TEXT NOT NULL, subject TEXT,
+            template_name TEXT, template_language TEXT, template_params TEXT,
+            status TEXT NOT NULL, provider TEXT, provider_message_id TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL DEFAULT 5,
+            next_attempt_at TEXT, idempotency_key TEXT, request_id TEXT, created_by TEXT,
+            reference TEXT, last_error TEXT, scheduled_at TEXT, read_at TEXT,
+            acknowledged_at TEXT, acknowledgement_type TEXT,
+            acknowledgement_message TEXT, acknowledgement_source TEXT,
+            parent_notification_id TEXT, resend_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        """
+    )
+    # Mark the first three migrations applied so only 0004 (content_hash) runs.
+    for mid in ("0001_initial_schema", "0002_add_acknowledgement_columns",
+                "0003_add_parent_resend_columns"):
+        conn.execute("INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)",
+                     (mid, "2026-01-01T00:00:00+00:00"))
+    conn.commit()
+    conn.close()
+
+    n = migrate.up()
+    assert n == 1  # only 0004 applied
+
+    conn = sqlite3.connect(mig_settings)
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(notifications)")}
+    assert "content_hash" in columns
+    conn.close()
+
+
 def test_migration_success_records_applied(mig_settings):
     from app import migrate
 

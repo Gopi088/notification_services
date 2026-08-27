@@ -193,6 +193,13 @@ def orchestrate_send(req: SendRequest, background_tasks, message_ids: Optional[L
     for idx, cr in enumerate(req.channels):
         notification_id = message_ids[idx] if message_ids and idx < len(message_ids) else str(uuid.uuid4())
         params = {p.name: p.value for p in cr.template_params} if cr.template_params else None
+        user_id = getattr(req, "_user_id", None) or "anonymous"
+        from app.idempotency import content_fingerprint
+
+        chash = content_fingerprint(
+            user_id, cr.channel.value, cr.contact, req.message,
+            cr.template_name, params,
+        )
         internal_id = storage.create_notification(
             message_id=notification_id,
             channel=cr.channel.value,
@@ -204,6 +211,7 @@ def orchestrate_send(req: SendRequest, background_tasks, message_ids: Optional[L
             template_name=cr.template_name,
             template_language=cr.template_language,
             template_params=params,
+            content_hash=chash,
             request_id=getattr(req, "_request_id", None),
             created_by=getattr(req, "_user_id", None),
             max_attempts=settings.MAX_ATTEMPTS,

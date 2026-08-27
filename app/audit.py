@@ -42,6 +42,8 @@ AUDIT_EVENTS = {
     "notification_retrying",
     "notification_cancelled",
     "duplicate_notification_attempted",
+    "duplicate_attempted",
+    "resend",
     "rate_limit_exceeded",
     "authorization_denied",
     "provider_failure",

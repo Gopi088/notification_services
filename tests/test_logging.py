@@ -170,7 +170,15 @@ def test_debug_flow_logs_are_safe_and_correlated(caplog):
     assert "channel=sms" in caplog.text
 
 
-def test_validation_error_logging_does_not_include_submitted_value(capsys):
+def test_validation_error_logging_does_not_include_submitted_value(caplog):
+    """The validation handler logs method/path/count but never the submitted input.
+
+    Uses caplog (not capsys) because the app's stdout handler is bound to the
+    sys.stdout captured when app.main was first imported, which is not the
+    capsys buffer when this test runs later in the suite.
+    """
+    import logging
+
     from fastapi import Request
     from fastapi.exceptions import RequestValidationError
     from app.main import request_validation_error_handler
@@ -180,11 +188,11 @@ def test_validation_error_logging_does_not_include_submitted_value(capsys):
         "type": "string_too_short", "loc": ("body", "message"),
         "msg": "too short", "input": "private-message-content",
     }])
-    response = __import__("asyncio").run(request_validation_error_handler(request, error))
+    with caplog.at_level(logging.ERROR, logger="app"):
+        response = __import__("asyncio").run(request_validation_error_handler(request, error))
     assert response.status_code == 422
-    output = capsys.readouterr().out
-    assert "request validation failed" in output
-    assert "private-message-content" not in output
+    assert "request validation failed" in caplog.text
+    assert "private-message-content" not in caplog.text
 
 
 def test_terminal_level_filter_info_only():
@@ -404,7 +412,8 @@ def test_log_level_filter_predicate():
 
 
 def test_plain_formatter_colors_levels():
-    """PlainFormatter colours the level name by level."""
+    """PlainFormatter colours problems as a whole red/yellow line; INFO/DEBUG
+    colour only the level badge."""
     import io
     import logging
 
@@ -417,10 +426,12 @@ def test_plain_formatter_colors_levels():
         return fmt.format(rec)
 
     assert "\033[32mINFO\033[0m" in _fmt(logging.INFO)
-    assert "\033[33mWARNING\033[0m" in _fmt(logging.WARNING)
-    assert "\033[31mERROR\033[0m" in _fmt(logging.ERROR)
-    assert "\033[35m" in _fmt(logging.CRITICAL) and "\033[1m" in _fmt(logging.CRITICAL)
     assert "\033[36mDEBUG\033[0m" in _fmt(logging.DEBUG)
+    # WARNING / ERROR / CRITICAL colour the entire line, not just the badge.
+    assert _fmt(logging.WARNING).startswith("\033[33m") and _fmt(logging.WARNING).endswith("\033[0m")
+    assert _fmt(logging.ERROR).startswith("\033[31m") and _fmt(logging.ERROR).endswith("\033[0m")
+    crit = _fmt(logging.CRITICAL)
+    assert crit.startswith("\033[35m\033[1m") and crit.endswith("\033[0m")
 
 
 def test_plain_formatter_no_colors_when_disabled():
@@ -437,8 +448,11 @@ def test_cli_colorize_log_line():
     from notification_service import _colorize_log_line
 
     out = _colorize_log_line("2026-01-01 ERROR app: boom")
-    assert "\033[31mERROR\033[0m" in out
+    assert out.startswith("\033[31m") and out.endswith("\033[0m")
     assert "boom" in out
+    info = _colorize_log_line("2026-01-01 INFO app: ok")
+    assert "\033[32mINFO\033[0m" in info
+    assert not info.startswith("\033[32m")
 
 
 def test_configure_logging_terminal_colors(monkeypatch):

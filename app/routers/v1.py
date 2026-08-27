@@ -11,17 +11,20 @@ Design:
   orchestrator -> queue -> worker -> DB.
 - Idempotency + rate limiting enforced when enabled.
 """
+import datetime
 import logging
+import time
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 
 from app import __version__
 from app.auth import user_id_from_request
 from app.config import get_settings
 from app.idempotency import (
     check_redis,
+    content_fingerprint,
     derive_key,
     normalize_client_key,
     payload_hash,
@@ -60,6 +63,68 @@ def _send_error(code: str, message: str, field: Optional[str] = None) -> HTTPExc
         status_code=400,
         detail=ErrorResponse(error={"code": code, "message": message, "field": field}).model_dump(),
     )
+
+
+DUPLICATE_MESSAGE = "This message was already sent recently. Do you want to resend?"
+
+
+def _duplicate_send_response(
+    request_id: str, user_id: str, original: dict, channel: Optional[str] = None,
+) -> SendResponse:
+    """Build the 202 duplicate response (existing result, NOT resent) + audit.
+
+    The original notification is left untouched and its existing message_id /
+    status are returned so the caller can decide whether to resend.
+    """
+    status = original.get("status", "queued")
+    chan = channel or original.get("channel")
+    record_audit(
+        user_id=user_id, action="duplicate_attempted",
+        notification_id=original["message_id"], channel=chan,
+        status=status, request_id=request_id, result="duplicate",
+    )
+    return SendResponse(
+        message_id=original["message_id"],
+        reference=original.get("reference"),
+        status=status,
+        duplicate=True,
+        message=DUPLICATE_MESSAGE,
+        channels=[ChannelQueued(
+            message_id=original["message_id"],
+            channel=chan or "sms",
+            status=status,
+            contact=original.get("contact", ""),
+        )],
+    )
+
+
+def _within_window(created_at: Optional[str], window_minutes: int) -> bool:
+    """True when a notification's created_at falls within the duplicate window.
+
+    The window is compared against the notification's creation time (not the
+    idempotency key's creation time) so that a notification sent outside the
+    window is treated as a new send regardless of key expiry.
+    """
+    if not window_minutes or window_minutes <= 0:
+        return False  # window disabled
+    if not created_at:
+        return True  # unknown age — err on the safe side
+    try:
+        created = datetime.datetime.fromisoformat(created_at)
+        age = (datetime.datetime.now(datetime.timezone.utc) - created).total_seconds()
+        return age <= window_minutes * 60
+    except Exception:
+        return True
+
+
+def _is_duplicate(original: dict, has_client_key: bool, window_minutes: int) -> bool:
+    """True when the request should be treated as a duplicate.
+
+    Client-supplied Idempotency-Keys always replay (explicit contract).
+    Server-derived keys replay only when the original notification is still
+    within the duplicate window.
+    """
+    return bool(has_client_key) or _within_window(original.get("created_at"), window_minutes)
 
 
 def _get_request_id(request: Request) -> str:
@@ -101,7 +166,8 @@ def health() -> HealthResponse:
     ),
     responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
 )
-def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Request) -> SendResponse:
+def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Request,
+         response: Response) -> SendResponse:
     request_id = _get_request_id(request)
     user_id = user_id_from_request(request)
     logger.info("API request received method=send channels=%s request_id=%s user_id=%s",
@@ -145,37 +211,31 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
             ",".join(c.contact for c in payload.channels),
             payload.message,
             payload.reference,
+            user_id=user_id,
         )
     logger.debug("send idempotency resolved request_id=%s user_id=%s source=%s",
                  request_id, user_id, "client" if header_key else "derived")
 
+    # Server-derived keys expire after the duplicate window so the same content
+    # can be sent again once the window has passed (a duplicate outside the
+    # window is a NEW notification). Client-supplied keys keep their own TTL.
+    duplicate_window = get_settings().DUPLICATE_WINDOW_MINUTES
+    derived_ttl = None
+    if not header_key and duplicate_window and duplicate_window > 0:
+        derived_ttl = duplicate_window * 60
+
     # Redis fast-path duplicate check.
     existing_id = check_redis(idem_key)
-    if existing_id:
+    if existing_id and not payload.resend:
         existing = get_message_summary(existing_id)
+        if existing and _is_duplicate(existing, header_key, duplicate_window):
+            response.headers["X-Idempotent-Replay"] = "true"
+            return _duplicate_send_response(request_id, user_id, existing)
         if existing:
-            logger.warning("duplicate notification detected idempotency_key=%s request_id=%s",
-                           idem_key, request_id)
-            record_audit(
-                user_id=key_id, action="duplicate_notification_attempted",
-                notification_id=existing_id, status=existing["status"],
-                request_id=request_id, result="already_exists",
-            )
-            raise HTTPException(
-                status_code=202,
-                headers={"X-Idempotent-Replay": "true"},
-                detail=SendResponse(
-                    message_id=existing["message_id"],
-                    reference=existing.get("reference"),
-                    status=existing["status"],
-                    channels=[ChannelQueued(
-                        message_id=existing["message_id"],
-                        channel=existing["channel"],
-                        status=existing["status"],
-                        contact=existing["contact"],
-                    )],
-                ).model_dump(),
-            )
+            # Derived key but the original is outside the window - send anew.
+            logger.info("duplicate outside window, sending as new notification request_id=%s",
+                        request_id)
+            idem_key = f"{idem_key}:{int(time.time())}"
 
     # ---- Per-recipient rate limiting ----
     for cr in payload.channels:
@@ -199,6 +259,30 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
         logger.debug("send validation passed request_id=%s user_id=%s channel=%s",
                      request_id, user_id, cr.channel.value)
 
+    # ---- Window-based content duplicate check ----
+    # A notification with the same user + channel + recipient + message/template
+    # content sent within DUPLICATE_WINDOW_MINUTES is a duplicate. Outside the
+    # window it is treated as a new send. Explicit resends always proceed.
+    window = get_settings().DUPLICATE_WINDOW_MINUTES
+    if window and window > 0 and not payload.resend:
+        storage = get_storage()
+        for cr in payload.channels:
+            params = {p.name: p.value for p in cr.template_params} if cr.template_params else None
+            chash = content_fingerprint(
+                user_id, cr.channel.value, cr.contact, payload.message,
+                cr.template_name, params,
+            )
+            dup = storage.find_recent_by_content_hash(chash, window)
+            if dup:
+                original = get_message_summary(dup["message_id"])
+                if original:
+                    logger.warning(
+                        "duplicate notification within window detected request_id=%s user_id=%s channel=%s",
+                        request_id, user_id, cr.channel.value,
+                    )
+                    response.headers["X-Idempotent-Replay"] = "true"
+                    return _duplicate_send_response(request_id, user_id, original, channel=cr.channel.value)
+
     # ---- Durable idempotency claim BEFORE creating the notification ----
     # The DB unique constraint on idempotency_keys.key is the concurrency
     # mutex: only one of N concurrent requests with the same key wins the
@@ -216,42 +300,32 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
     original = get_message_summary(original_nid) if original_nid else None
 
     if existing_row and original and not payload.resend:
-        # Accidental duplicate: return the existing notification, DO NOT resend.
-        store_redis(idem_key, original_nid)
-        logger.warning("duplicate notification detected idempotency_key=%s request_id=%s",
-                       idem_key, request_id)
-        record_audit(
-            user_id=key_id, action="duplicate_notification_attempted",
-            notification_id=original_nid, status=original["status"],
-            request_id=request_id, result="already_exists",
-        )
-        raise HTTPException(
-            status_code=202,
-            headers={"X-Idempotent-Replay": "true"},
-            detail=SendResponse(
-                message_id=original["message_id"],
-                reference=original.get("reference"),
-                status=original["status"],
-                channels=[ChannelQueued(
-                    message_id=original["message_id"],
-                    channel=original["channel"],
-                    status=original["status"],
-                    contact=original["contact"],
-                )],
-            ).model_dump(),
-        )
+        if _is_duplicate(original, header_key, duplicate_window):
+            # Accidental duplicate: return the existing notification, DO NOT resend.
+            store_redis(idem_key, original_nid, ex=derived_ttl)
+            response.headers["X-Idempotent-Replay"] = "true"
+            return _duplicate_send_response(request_id, user_id, original)
+        # Derived key but the original is outside the window: this content is
+        # a NEW notification. Use a fresh key so the old row cannot dedupe it.
+        logger.info("duplicate outside window, sending as new notification request_id=%s",
+                    request_id)
+        idem_key = f"{idem_key}:{int(time.time())}"
+        existing_row = None
+        original = None
 
     if existing_row and original and payload.resend:
         # Explicit resend: create a NEW notification linked to the original.
         # Each resend uses a fresh idempotency key so it cannot be accidentally
         # deduplicated against the original or another resend.
         resend_key = f"{idem_key}:resend:{uuid.uuid4().hex[:12]}"
+        channel = payload.channels[0].channel.value if payload.channels else None
         logger.warning("resend requested idempotency_key=%s original=%s request_id=%s",
                        idem_key, original_nid, request_id)
         record_audit(
-            user_id=key_id, action="notification_resend_requested",
-            notification_id=original_nid, channel=payload.channels[0].channel.value if payload.channels else None,
-            request_id=request_id, result="queued",
+            user_id=user_id, action="duplicate_attempted",
+            notification_id=original_nid, channel=channel,
+            status=original["status"], request_id=request_id,
+            result="duplicate", metadata={"resend": True},
         )
 
         # Link the resend to the original's internal id (parent_notification_id
@@ -261,15 +335,15 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
         parent_id = original_row["id"] if original_row else original_nid
 
         resend_ids = [str(uuid.uuid4()) for _ in payload.channels]
-        claim_idempotency_key(resend_key, resend_ids[0], ph)
+        claim_idempotency_key(resend_key, resend_ids[0], ph, ttl_seconds=derived_ttl)
         summary = orchestrate_send(payload, background_tasks, message_ids=resend_ids,
                                    parent_notification_id=parent_id)
-        store_redis(resend_key, resend_ids[0])
+        store_redis(resend_key, resend_ids[0], ex=derived_ttl)
         new_mid = summary["channels"][0]["message_id"]
         record_audit(
-            user_id=key_id, action="notification_resent",
-            notification_id=new_mid,
-            request_id=request_id, channel=payload.channels[0].channel.value if payload.channels else None,
+            user_id=user_id, action="resend",
+            notification_id=new_mid, channel=channel,
+            request_id=request_id,
             metadata={"original_notification_id": original_nid},
         )
         logger.info("resent notification original=%s new=%s request_id=%s",
@@ -283,7 +357,7 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
         )
 
     # ---- Claim the idempotency key (new request) ----
-    claimed = claim_idempotency_key(idem_key, pre_ids[0], ph)
+    claimed = claim_idempotency_key(idem_key, pre_ids[0], ph, ttl_seconds=derived_ttl)
     if not claimed:
         # Someone else claimed this key first - replay their notification.
         existing_row = None
@@ -292,55 +366,51 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
             if existing_row:
                 break
             _time.sleep(0.02)
+        existing = None
         if existing_row:
             nid = existing_row.get("notification_id")
             existing = get_message_summary(nid)
+            if existing and _is_duplicate(existing, header_key, duplicate_window):
+                store_redis(idem_key, nid, ex=derived_ttl)
+                response.headers["X-Idempotent-Replay"] = "true"
+                return _duplicate_send_response(request_id, user_id, existing)
             if existing:
-                store_redis(idem_key, nid)
-                logger.warning("duplicate notification detected idempotency_key=%s request_id=%s",
-                               idem_key, request_id)
-                record_audit(
-                    user_id=key_id, action="duplicate_notification_attempted",
-                    notification_id=nid, status=existing["status"],
-                    request_id=request_id, result="already_exists",
-                )
-                raise HTTPException(
-                    status_code=202,
-                    headers={"X-Idempotent-Replay": "true"},
-                    detail=SendResponse(
-                        message_id=existing["message_id"],
-                        reference=existing.get("reference"),
-                        status=existing["status"],
-                        channels=[ChannelQueued(
-                            message_id=existing["message_id"],
-                            channel=existing["channel"],
-                            status=existing["status"],
-                            contact=existing["contact"],
-                        )],
-                    ).model_dump(),
-                )
-        # Key claimed elsewhere but notification truly not found (edge case).
-        logger.warning("idempotency key claimed but no notification found key=%s request_id=%s",
-                       idem_key, request_id)
-        record_audit(
-            user_id=key_id, action="duplicate_notification_attempted",
-            notification_id=pre_ids[0], status="processing",
-            request_id=request_id, result="already_exists",
-        )
-        raise HTTPException(
-            status_code=202,
-            headers={"X-Idempotent-Replay": "true"},
-            detail=SendResponse(
+                # Contended key but notification outside the window: retry with
+                # a fresh derived key so the send is not lost.
+                logger.info("duplicate outside window, retrying with fresh key request_id=%s",
+                            request_id)
+                idem_key = f"{idem_key}:{int(time.time())}"
+                claimed = claim_idempotency_key(idem_key, pre_ids[0], ph, ttl_seconds=derived_ttl)
+                if claimed:
+                    existing_row = None
+                    existing = None
+                else:
+                    # Still contended — replay the existing result.
+                    store_redis(idem_key, nid, ex=derived_ttl)
+                    response.headers["X-Idempotent-Replay"] = "true"
+                    return _duplicate_send_response(request_id, user_id, existing)
+        if existing_row is not None or existing is not None:
+            # Key claimed elsewhere but notification truly not found (edge case).
+            logger.warning("idempotency key claimed but no notification found key=%s request_id=%s",
+                           idem_key, request_id)
+            record_audit(
+                user_id=user_id, action="duplicate_attempted",
+                notification_id=pre_ids[0], status="processing",
+                request_id=request_id, result="duplicate",
+            )
+            response.headers["X-Idempotent-Replay"] = "true"
+            return SendResponse(
                 message_id=pre_ids[0],
                 status="processing",
+                duplicate=True,
+                message=DUPLICATE_MESSAGE,
                 channels=[ChannelQueued(
                     message_id=pre_ids[0],
                     channel=payload.channels[0].channel.value if payload.channels else "sms",
                     status="processing",
                     contact=payload.channels[0].contact if payload.channels else "",
                 )],
-            ).model_dump(),
-        )
+            )
 
     # ---- Enqueue ----
     summary = orchestrate_send(payload, background_tasks, message_ids=pre_ids)
@@ -350,7 +420,7 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
     # Map the idempotency key to the first channel's message_id so a future
     # duplicate request can replay the original result via Redis.
     first_mid = summary["channels"][0]["message_id"]
-    store_redis(idem_key, first_mid)
+    store_redis(idem_key, first_mid, ex=derived_ttl)
 
     logger.info("API request completed request_id=%s group_id=%s status=queued",
                 request_id, summary["message_id"])

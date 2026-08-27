@@ -40,6 +40,12 @@ _MIGRATION_PG_ADD_RESEND = (
     "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS resend_count INTEGER NOT NULL DEFAULT 0;"
 )
 
+_MIGRATION_PG_ADD_CONTENT_HASH = (
+    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS content_hash TEXT;"
+    "CREATE INDEX IF NOT EXISTS idx_notifications_content_hash "
+    "ON notifications (content_hash, created_at);"
+)
+
 # Columns that 0002 adds for existing databases (fresh DBs already have them
 # via SQLITE_SCHEMA / PG_SCHEMA CREATE TABLE).
 _ACK_COLUMNS = {
@@ -50,6 +56,7 @@ _ACK_COLUMNS = {
     "acknowledgement_source": "TEXT",
     "parent_notification_id": "TEXT",
     "resend_count": "INTEGER NOT NULL DEFAULT 0",
+    "content_hash": "TEXT",
 }
 
 
@@ -66,6 +73,13 @@ def _repair_sqlite_notification_columns(conn) -> None:
     for col, typ in _ACK_COLUMNS.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE notifications ADD COLUMN {col} {typ}")
+    # The duplicate-detection index depends on content_hash; create it only
+    # after the column is guaranteed to exist.
+    if "content_hash" in existing or "content_hash" in _ACK_COLUMNS:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notifications_content_hash "
+            "ON notifications (content_hash, created_at)"
+        )
 
 _MIGRATIONS: List[dict] = [
     {"id": "0001_initial_schema", "pg": PG_SCHEMA, "sqlite": SQLITE_SCHEMA},
@@ -74,6 +88,9 @@ _MIGRATIONS: List[dict] = [
      "sqlite": None},  # handled specially below (column-aware)
     {"id": "0003_add_parent_resend_columns",
      "pg": _MIGRATION_PG_ADD_RESEND,
+     "sqlite": None},  # handled specially below (column-aware)
+    {"id": "0004_add_content_hash_column",
+     "pg": _MIGRATION_PG_ADD_CONTENT_HASH,
      "sqlite": None},  # handled specially below (column-aware)
 ]
 

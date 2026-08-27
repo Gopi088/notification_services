@@ -43,6 +43,23 @@ def test_factory_sms_prefers_vonage(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_factory_sms_prefers_twilio(monkeypatch):
+    import os
+
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.providers.factory import get_provider
+    from app.schemas import Channel
+
+    p = get_provider(Channel.sms)
+    assert p.name == "twilio_sms"
+    get_settings.cache_clear()
+
+
 def test_factory_sms_falls_back_to_azure(monkeypatch):
     import os
 
@@ -73,6 +90,43 @@ def test_factory_whatsapp_prefers_vonage(monkeypatch):
 
     p = get_provider(Channel.whatsapp)
     assert p.name == "vonage_whatsapp"
+    get_settings.cache_clear()
+
+
+def test_factory_whatsapp_prefers_twilio(monkeypatch):
+    import os
+
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    monkeypatch.setenv("TWILIO_WHATSAPP_FROM", "+17372508034")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.providers.factory import get_provider
+    from app.schemas import Channel
+
+    p = get_provider(Channel.whatsapp)
+    assert p.name == "twilio_whatsapp"
+    get_settings.cache_clear()
+
+
+def test_factory_twilio_requires_sender(monkeypatch):
+    import os
+
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACx")
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "t")
+    monkeypatch.setenv("TWILIO_FROM", "")
+    monkeypatch.setenv("TWILIO_WHATSAPP_FROM", "")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    from app.providers.factory import get_provider
+    from app.schemas import Channel
+
+    # Twilio configured but no sender -> falls through to Vonage/Azure
+    assert get_provider(Channel.sms).name != "twilio_sms"
+    assert get_provider(Channel.whatsapp).name != "twilio_whatsapp"
     get_settings.cache_clear()
 
 

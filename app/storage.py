@@ -67,6 +67,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     template_name        TEXT,
     template_language    TEXT,
     template_params      TEXT,
+    content_hash         TEXT,
     status               TEXT NOT NULL,
     provider             TEXT,
     provider_message_id  TEXT,
@@ -177,6 +178,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     template_name        TEXT,
     template_language    TEXT,
     template_params      JSONB,
+    content_hash         TEXT,
     status               TEXT NOT NULL,
     provider             TEXT,
     provider_message_id  TEXT,
@@ -428,6 +430,7 @@ class Storage:
                             template_name: Optional[str] = None,
                             template_language: Optional[str] = None,
                             template_params: Optional[Dict] = None,
+                            content_hash: Optional[str] = None,
                             idempotency_key: Optional[str] = None,
                             request_id: Optional[str] = None,
                             created_by: Optional[str] = None,
@@ -448,12 +451,13 @@ class Storage:
                 cur.execute(
                     """INSERT INTO notifications
                        (id, message_id, group_id, channel, recipient, message, subject,
-                        template_name, template_language, template_params, status,
+                        template_name, template_language, template_params, content_hash, status,
                         retry_count, max_attempts, idempotency_key, request_id, created_by,
                         reference, parent_notification_id, resend_count, created_at, updated_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                     (nid, message_id, group_id, channel, recipient, message, subject,
                      template_name, template_language, _json.dumps(template_params) if template_params else None,
+                     content_hash,
                      status, 0, max_a, idempotency_key, request_id, created_by,
                      reference, parent_notification_id, resend_count, now, now),
                 )
@@ -462,12 +466,12 @@ class Storage:
                 conn.execute(
                     """INSERT INTO notifications
                        (id, message_id, group_id, channel, recipient, message, subject,
-                        template_name, template_language, template_params, status,
+                        template_name, template_language, template_params, content_hash, status,
                         retry_count, max_attempts, idempotency_key, request_id, created_by,
                         reference, parent_notification_id, resend_count, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (nid, message_id, group_id, channel, recipient, message, subject,
-                     template_name, template_language, params_json, status,
+                     template_name, template_language, params_json, content_hash, status,
                      0, max_a, idempotency_key, request_id, created_by,
                      reference, parent_notification_id, resend_count, now, now),
                 )
@@ -489,6 +493,36 @@ class Storage:
                     "SELECT * FROM notifications WHERE id = ?", (notification_id,)
                 ).fetchone()
         return self._row_to_dict(row)
+
+    def find_recent_by_content_hash(self, content_hash: str, window_minutes: int) -> Optional[Dict]:
+        """Return the most recent notification matching a content fingerprint
+        that was created within the window, or None.
+
+        Used by window-based duplicate detection: the same user + channel +
+        recipient + message/template sent again within the window is a
+        duplicate; outside the window it is a new notification.
+        """
+        import datetime as _dt
+
+        cutoff = (datetime.now(timezone.utc) - _dt.timedelta(minutes=window_minutes)).isoformat()
+        if self.backend == "postgres":
+            with self._pg() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """SELECT * FROM notifications
+                       WHERE content_hash = %s AND created_at >= %s
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (content_hash, cutoff),
+                )
+                return self._row_to_dict(cur.fetchone(), cur)
+        else:
+            with self._sqlite() as conn:
+                row = conn.execute(
+                    """SELECT * FROM notifications
+                       WHERE content_hash = ? AND created_at >= ?
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (content_hash, cutoff),
+                ).fetchone()
+                return self._row_to_dict(row)
 
     def get_notification_by_message_id(self, message_id: str) -> Optional[Dict]:
         if self.backend == "postgres":
@@ -738,13 +772,17 @@ class Storage:
         """Return the raw idempotency_keys row for a key (durable dedup)."""
         if self.backend == "postgres":
             with self._pg() as conn, conn.cursor() as cur:
-                cur.execute("SELECT * FROM idempotency_keys WHERE key=%s", (key,))
+                cur.execute(
+                    "SELECT * FROM idempotency_keys WHERE key=%s AND expires_at >= %s",
+                    (key, _now()),
+                )
                 row = cur.fetchone()
                 return self._row_to_dict(row, cur)
         else:
             with self._sqlite() as conn:
                 row = conn.execute(
-                    "SELECT * FROM idempotency_keys WHERE key=?", (key,)
+                    "SELECT * FROM idempotency_keys WHERE key=? AND expires_at >= ?",
+                    (key, _now()),
                 ).fetchone()
                 return self._row_to_dict(row)
 
@@ -756,16 +794,23 @@ class Storage:
         nid = row.get("notification_id")
         return self.get_notification(nid) if nid else None
 
-    def store_idempotency_key(self, key: str, notification_id: str, payload_hash: str) -> bool:
+    def store_idempotency_key(self, key: str, notification_id: str, payload_hash: str,
+                              ttl_seconds: Optional[int] = None) -> bool:
         now = _now()
         import datetime as _dt
-        expires = (
-            datetime.now(timezone.utc)
-            + _dt.timedelta(seconds=get_settings().IDEMPOTENCY_TTL_SECONDS)
-        ).isoformat()
+        ttl = ttl_seconds if ttl_seconds is not None else get_settings().IDEMPOTENCY_TTL_SECONDS
+        expires = (datetime.now(timezone.utc) + _dt.timedelta(seconds=ttl)).isoformat()
         try:
             if self.backend == "postgres":
                 with self._pg() as conn, conn.cursor() as cur:
+                    # Clear any EXPIRED row for this key so a new send can
+                    # reuse the key once the duplicate window has passed. An
+                    # unexpired row is left in place and makes the INSERT below
+                    # conflict (concurrency mutex preserved).
+                    cur.execute(
+                        "DELETE FROM idempotency_keys WHERE key=%s AND expires_at < %s",
+                        (key, now),
+                    )
                     cur.execute(
                         """INSERT INTO idempotency_keys (key, notification_id, payload_hash, created_at, expires_at)
                            VALUES (%s,%s,%s,%s,%s)""",
@@ -773,6 +818,10 @@ class Storage:
                     )
             else:
                 with self._sqlite() as conn:
+                    conn.execute(
+                        "DELETE FROM idempotency_keys WHERE key=? AND expires_at < ?",
+                        (key, now),
+                    )
                     conn.execute(
                         """INSERT INTO idempotency_keys (key, notification_id, payload_hash, created_at, expires_at)
                            VALUES (?,?,?,?,?)""",

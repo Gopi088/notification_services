@@ -76,3 +76,40 @@ def test_payload_hash_stable():
     h1 = payload_hash({"channels": [{"channel": "sms"}], "message": "hi"})
     h2 = payload_hash({"message": "hi", "channels": [{"channel": "sms"}]})
     assert h1 == h2  # sort_keys -> order independent
+
+
+def test_content_fingerprint_identifies_duplicate():
+    from app.idempotency import content_fingerprint
+
+    a = content_fingerprint("user1", "sms", "+919887270348", "hello")
+    b = content_fingerprint("user1", "sms", "+919887270348", "hello")
+    assert a == b  # identical content -> same fingerprint
+
+    # Different user / channel / recipient / message all change the fingerprint.
+    assert a != content_fingerprint("user2", "sms", "+919887270348", "hello")
+    assert a != content_fingerprint("user1", "whatsapp", "+919887270348", "hello")
+    assert a != content_fingerprint("user1", "sms", "+15551234567", "hello")
+    assert a != content_fingerprint("user1", "sms", "+919887270348", "other")
+
+
+def test_content_fingerprint_template_aware():
+    from app.idempotency import content_fingerprint
+
+    t1 = content_fingerprint("u", "whatsapp", "+919887270348", "free text",
+                             template_name="test_template", template_params={"1": "Rahul"})
+    t2 = content_fingerprint("u", "whatsapp", "+919887270348", "free text",
+                             template_name="test_template", template_params={"1": "Rahul"})
+    t3 = content_fingerprint("u", "whatsapp", "+919887270348", "free text",
+                             template_name="test_template", template_params={"1": "Other"})
+    free = content_fingerprint("u", "whatsapp", "+919887270348", "free text")
+    assert t1 == t2
+    assert t1 != t3  # different template params
+    assert t1 != free  # template send != free-text send
+
+
+def test_derive_key_includes_user():
+    from app.idempotency import derive_key
+
+    k1 = derive_key("sms", "+919887270348", "hello", None, user_id="user-a")
+    k2 = derive_key("sms", "+919887270348", "hello", None, user_id="user-b")
+    assert k1 != k2  # different users never share a derived key

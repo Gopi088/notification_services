@@ -84,6 +84,16 @@ class SendRequest(BaseModel):
     # Explicit resend: when true and the idempotency key already exists, create
     # a NEW notification linked to the original instead of blocking.
     resend: bool = False
+    # Alias for `resend` (either name is accepted).
+    force_resend: Optional[bool] = Field(
+        None, description="Alias for resend: force a new send of an already-sent message"
+    )
+
+    @model_validator(mode="after")
+    def _apply_force_resend(self) -> "SendRequest":
+        if self.force_resend:
+            self.resend = True
+        return self
 
     @field_validator("message")
     @classmethod
@@ -119,6 +129,11 @@ class SendResponse(BaseModel):
     reference: Optional[str] = None
     status: Status = Status.queued
     channels: List[ChannelQueued]
+    # True when the request was an exact duplicate (not resent). The existing
+    # result is returned instead of creating a new notification.
+    duplicate: bool = False
+    # Human-readable guidance shown for duplicates.
+    message: Optional[str] = None
 
 
 class ChannelStatus(BaseModel):

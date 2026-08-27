@@ -7,6 +7,7 @@ all routers, and exposes liveness/readiness/health endpoints.
 import logging
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -71,7 +72,10 @@ async def request_validation_error_handler(
         "request validation failed method=%s path=%s status=422 error_count=%d",
         request.method, request.url.path, len(exc.errors()),
     )
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # jsonable_encoder makes every entry JSON-serializable: validator errors
+    # embed the raised exception in ctx.error, which would otherwise crash the
+    # JSONResponse with a TypeError (e.g. a duplicate-channel ValueError).
+    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
 
 
 @app.exception_handler(HTTPException)

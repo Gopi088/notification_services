@@ -19,6 +19,11 @@ os.environ["RATELIMIT_ENABLED"] = "false"
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 os.environ["AUTH_ENABLED"] = "false"
 os.environ["LOG_LEVEL"] = "ERROR"
+# Twilio must never be picked up from `.env` unless a test opts in explicitly.
+os.environ["TWILIO_ACCOUNT_SID"] = ""
+os.environ["TWILIO_AUTH_TOKEN"] = ""
+os.environ["TWILIO_FROM"] = ""
+os.environ["TWILIO_WHATSAPP_FROM"] = ""
 
 _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["DATABASE_PATH"] = _tmp_db.name

@@ -5,6 +5,8 @@ All values are loaded from environment variables / a `.env` file in the
 project root. See `.env.example` for the full list of supported keys.
 """
 from functools import lru_cache
+import re
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -29,6 +31,14 @@ class Settings(BaseSettings):
     # status endpoint flags it as timed_out. Real delivery receipts arrive via
     # the webhook; this threshold tells callers when to stop waiting.
     DELIVERY_TIMEOUT_SECONDS: int = 300
+
+    # --- Duplicate detection ---
+    # Window (minutes) during which sending the SAME content (user + channel +
+    # recipient + message/template) to the same recipient is treated as a
+    # duplicate and blocked with a "do you want to resend?" response. Sends of
+    # the same message OUTSIDE this window are treated as new notifications.
+    # Set to 0 to disable window-based duplicate detection.
+    DUPLICATE_WINDOW_MINUTES: int = 30
 
     # --- Storage / Database ---
     # Storage backend: "sqlite" (dev/fallback) or "postgres" (production).
@@ -133,6 +143,31 @@ class Settings(BaseSettings):
     VONAGE_WHATSAPP_FROM: str = ""
     VONAGE_WHATSAPP_SANDBOX_URL: str = "https://messages-sandbox.nexmo.com/v1/messages"
 
+    # --- Twilio (optional SMS + WhatsApp provider) ---
+    # When TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are set, the SMS and
+    # WhatsApp channels use Twilio instead of Vonage/Azure. Credentials from
+    # the Twilio console -> Account -> API keys & tokens. NEVER commit real
+    # secrets.
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    # Sender number for the SMS channel (E.164, e.g. +17372508034).
+    TWILIO_FROM: str = ""
+    # Predefined SMS template name (Twilio TRIAL accounts can ONLY send
+    # predefined SMS templates, not free-form text - error 572006 otherwise).
+    # When set, free-form SMS is automatically retried as this template when
+    # Twilio rejects the free-form body. Example: sms_appointment_reminders.
+    TWILIO_SMS_TEMPLATE: str = ""
+    # WhatsApp sender number (E.164). Falls back to TWILIO_FROM when empty.
+    TWILIO_WHATSAPP_FROM: str = ""
+    # Approved WhatsApp content template SID (e.g. HXfe5ab5f00277942d4d4200328b4d403c).
+    # Used for template sends to new contacts (no 24h session required).
+    TWILIO_WHATSAPP_CONTENT_SID: str = ""
+    # Optional mapping "friendly template name -> content SID" used when a
+    # request passes a template_name, e.g.
+    #   test_template=HXfe5ab5f00277942d4d4200328b4d403c;reminder=HX...
+    # (JSON object form is also accepted: {"test_template": "HX..."}).
+    TWILIO_WHATSAPP_TEMPLATES: str = ""
+
     # --- Email templates ---
     # Directory holding channel templates. Email templates are HTML files that
     # can contain {{subject}} and {{body}} placeholders.
@@ -206,6 +241,31 @@ class Settings(BaseSettings):
     def whatsapp_template_language(self) -> str:
         """Canonical default WhatsApp template language, honoring the alias."""
         return self.WHATSAPP_TEMPLATE_LANGUAGE or self.AZURE_WHATSAPP_TEMPLATE_LANGUAGE
+
+    @property
+    def twilio_whatsapp_from(self) -> str:
+        """WhatsApp sender number, falling back to the shared Twilio sender."""
+        return self.TWILIO_WHATSAPP_FROM or self.TWILIO_FROM
+
+    @property
+    def twilio_whatsapp_templates(self) -> dict:
+        """Parse TWILIO_WHATSAPP_TEMPLATES ("name=HX...;name2=HX..." or JSON)."""
+        raw = (self.TWILIO_WHATSAPP_TEMPLATES or "").strip()
+        if not raw:
+            return {}
+        if raw.lstrip().startswith("{"):
+            try:
+                import json as _json
+
+                return {str(k): str(v) for k, v in _json.loads(raw).items()}
+            except (ValueError, TypeError):
+                return {}
+        mapping: dict = {}
+        for part in re.split(r"[;,]", raw):
+            if "=" in part:
+                k, _, v = part.partition("=")
+                mapping[k.strip()] = v.strip()
+        return mapping
 
 
 @lru_cache

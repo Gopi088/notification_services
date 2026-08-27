@@ -122,43 +122,77 @@ class StructuredFormatter(logging.Formatter):
 class PlainFormatter(logging.Formatter):
     """Human-readable text formatter for terminals (LOG_FORMAT=text).
 
-    When `use_colors=True` (default for TTY terminals) the level name is
-    ANSI-coloured: DEBUG=blue, INFO=green, WARNING=yellow, ERROR=red,
-    CRITICAL=magenta+bold.
+    Fixed-width columns keep mixed DEBUG/INFO/ERROR terminal output easy to
+    scan, without changing handlers, files, or audit persistence:
+
+        %(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s   ·  key=value ...
+
+    When `use_colors=True` (default for TTY terminals):
+    - The WHOLE line is coloured for problems so they stand out immediately:
+      WARNING=yellow, ERROR=red, CRITICAL=magenta+bold.
+    - INFO/DEBUG keep a plain line but colour the level badge (green/cyan) and
+      dim the timestamp + structured fields so the message stays the focus.
+    File logs are never coloured.
     """
 
-    _COLORS = {
-        "DEBUG": "\033[36m",       # cyan
-        "INFO": "\033[32m",        # green
-        "WARNING": "\033[33m",     # yellow
-        "ERROR": "\033[31m",       # red
+    _LEVEL_COLORS = {
+        "DEBUG": "\033[36m",            # cyan
+        "INFO": "\033[32m",             # green
+        "WARNING": "\033[33m",          # yellow
+        "ERROR": "\033[31m",            # red
         "CRITICAL": "\033[35m\033[1m",  # magenta + bold
     }
+    # Levels that colour the entire line, not just the level badge.
+    _LINE_COLORS = {
+        "WARNING": "\033[33m",           # yellow
+        "ERROR": "\033[31m",             # red
+        "CRITICAL": "\033[35m\033[1m",   # magenta + bold
+    }
+    _DIM = "\033[2m"
     _RESET = "\033[0m"
 
     def __init__(self, fmt: Optional[str] = None, use_colors: bool = False):
-        # Fixed-width columns make mixed DEBUG/INFO/ERROR terminal output easy
-        # to scan without changing handlers, files, or audit persistence.
         super().__init__(fmt or "%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s")
         self.use_colors = use_colors
 
-    def format(self, record: logging.LogRecord) -> str:
-        base = super().format(record)
-        if self.use_colors:
-            color = self._COLORS.get(record.levelname, "")
-            if color:
-                # Replace the fixed-width level field with a coloured value.
-                colored = f"{color}{record.levelname}{self._RESET}"
-                base = base.replace(record.levelname, colored, 1)
+    def _extra_fields(self, record: logging.LogRecord) -> list:
+        """Collect structured fields in a stable order, redacting secrets."""
+        fields: list = []
         extra = getattr(record, "extra", None)
         if isinstance(extra, dict):
             for k, v in extra.items():
                 if k.lower() in _SECRET_KEYS:
                     v = "***"
-                base += f" {k}={v}"
-        for field in ("request_id", "notification_id", "user_id"):
-            if hasattr(record, field) and getattr(record, field):
-                base += f" {field}={getattr(record, field)}"
+                fields.append(f"{k}={v}")
+        for field in ("request_id", "notification_id", "user_id", "channel",
+                      "status", "provider", "attempt", "latency_ms", "error_code"):
+            if hasattr(record, field) and getattr(record, field) is not None:
+                fields.append(f"{field}={getattr(record, field)}")
+        return fields
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        fields = self._extra_fields(record)
+        tail = ("  ·  " + "  ".join(fields)) if fields else ""
+        line = base + tail
+        if record.exc_info:
+            line += "\n" + self.formatException(record.exc_info)
+
+        if not self.use_colors:
+            return line
+
+        level = record.levelname
+        whole = self._LINE_COLORS.get(level)
+        if whole:
+            return f"{whole}{line}{self._RESET}"
+
+        color = self._LEVEL_COLORS.get(level, "")
+        if color:
+            base = base.replace(level, f"{color}{level}{self._RESET}", 1)
+        ts = self.formatTime(record)
+        base = base.replace(ts, f"{self._DIM}{ts}{self._RESET}", 1)
+        if tail:
+            base += f"{self._DIM}{tail}{self._RESET}"
         return base
 
 

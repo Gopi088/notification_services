@@ -8,7 +8,8 @@ Notification Service CLI - run it like any Linux command.
   python3 notification_service.py send email   you@example.com "Order shipped"
   python3 notification_service.py send email,whatsapp +919887270348 "Order shipped"
   python3 notification_service.py send email you@example.com "Order shipped" --template default
-  python3 notification_service.py send-template <number> <template_name> [--param name=value ...]
+  python3 notification_service.py send sms 9887270348 "Resend this" --resend
+  python3 notification_service.py send-template <number> <template_name> [--param name=value ...] [--resend]
   python3 notification_service.py send-event event.json
   python3 notification_service.py status <message_id>
   python3 notification_service.py -v status <message_id>
@@ -278,18 +279,23 @@ def config_check() -> None:
         return
 
     conn = env.get("COMMUNICATION_SERVICES_CONNECTION_STRING") or env.get("AZURE_COMMUNICATION_CONNECTION_STRING", "")
+    twilio_ready = bool(env.get("TWILIO_ACCOUNT_SID")) and bool(env.get("TWILIO_AUTH_TOKEN"))
     if not conn or "your_" in conn:
-        print("! MOCK_MODE=false but COMMUNICATION_SERVICES_CONNECTION_STRING is")
-        print("  missing/placeholder in .env. Real sends will fail until you add it")
-        print("  (Azure portal -> Communication Services -> Keys -> Connection string).")
+        if twilio_ready:
+            print("! COMMUNICATION_SERVICES_CONNECTION_STRING is missing/placeholder - Email sends will fail.")
+            print("  (SMS/WhatsApp use Twilio; Azure is only required for the Email channel.)")
+        else:
+            print("! MOCK_MODE=false but COMMUNICATION_SERVICES_CONNECTION_STRING is")
+            print("  missing/placeholder in .env. Real sends will fail until you add it")
+            print("  (Azure portal -> Communication Services -> Keys -> Connection string).")
         print()
         return
-    if not env.get("AZURE_SMS_FROM"):
-        print("  (sms) AZURE_SMS_FROM is empty - SMS sends will fail")
+    if not env.get("AZURE_SMS_FROM") and not (twilio_ready and env.get("TWILIO_FROM")):
+        print("  (sms) AZURE_SMS_FROM is empty (and no Twilio TWILIO_FROM) - SMS sends will fail")
     if not env.get("AZURE_EMAIL_FROM"):
         print("  (email) AZURE_EMAIL_FROM is empty - Email sends will fail")
-    if not (env.get("WHATSAPP_CHANNEL_ID") or env.get("AZURE_WHATSAPP_CHANNEL_ID")):
-        print("  (whatsapp) WHATSAPP_CHANNEL_ID is empty - WhatsApp sends will fail")
+    if not (env.get("WHATSAPP_CHANNEL_ID") or env.get("AZURE_WHATSAPP_CHANNEL_ID")) and not (twilio_ready and (env.get("TWILIO_WHATSAPP_FROM") or env.get("TWILIO_FROM"))):
+        print("  (whatsapp) WHATSAPP_CHANNEL_ID is empty (and no Twilio sender) - WhatsApp sends will fail")
     print()
     print("  Note: WhatsApp outbound to a new contact needs an approved Meta")
     print("  template; free text only works inside a 24h session window.")
@@ -337,14 +343,25 @@ def _print_recent_logs(lines: int = 8, delay: float = 3.0,
     print("  -------------------------")
 
 
-def do_send_entries(entries: list, message: str) -> None:
-    """POST pre-built channel entries (each with its own channel/contact/template)."""
+def do_send_entries(entries: list, message: str, force: bool = False) -> None:
+    """POST pre-built channel entries (each with its own channel/contact/template).
+
+    `force=True` passes `resend=true` so the server creates a new notification
+    on duplicate instead of returning the existing one.
+    """
     payload = {"channels": entries, "message": message}
+    if force:
+        payload["resend"] = True
     code, resp_headers, body = http_full("POST", "/api/v1/notifications/send", payload)
 
-    # Duplicate detected: ask the user whether to resend.
-    if resp_headers.get("X-Idempotent-Replay", "").lower() == "true":
-        print("Notification already sent.")
+    # Duplicate detected: show the clear message and ask whether to resend.
+    if not force and (
+        resp_headers.get("X-Idempotent-Replay", "").lower() == "true"
+        or body.get("duplicate")
+    ):
+        dup_msg = body.get("message") or "This message was already sent. Do you want to resend?"
+        print(dup_msg)
+        print(f"Existing message id: {body.get('message_id', '?')} (status: {body.get('status', '?')})")
         try:
             answer = input("Do you want to resend? (y/n): ").strip().lower()
         except EOFError:
@@ -353,7 +370,6 @@ def do_send_entries(entries: list, message: str) -> None:
             payload["resend"] = True
             code, resp_headers, body = http_full("POST", "/api/v1/notifications/send", payload)
         else:
-            # Return the existing notification status.
             if body.get("message_id"):
                 print(f"Returning existing notification: {body['message_id']} (status: {body.get('status')})")
                 return
@@ -377,7 +393,8 @@ def do_send_entries(entries: list, message: str) -> None:
     _print_recent_logs(notification_id=first_id, group_id=group_id)
 
 
-def do_send(channels: list, message: str, template: str = "", template_params: dict | None = None) -> None:
+def do_send(channels: list, message: str, template: str = "", template_params: dict | None = None,
+            force: bool = False) -> None:
     entries = []
     for ch, ct in channels:
         entry = {"channel": ch, "contact": ct}
@@ -388,10 +405,11 @@ def do_send(channels: list, message: str, template: str = "", template_params: d
                 {"name": k, "value": v} for k, v in template_params.items()
             ]
         entries.append(entry)
-    do_send_entries(entries, message)
+    do_send_entries(entries, message, force=force)
 
 
-def do_send_template(number: str, template_name: str, template_params: dict | None = None) -> None:
+def do_send_template(number: str, template_name: str, template_params: dict | None = None,
+                     force: bool = False) -> None:
     """Send an approved WhatsApp template to a number (no 24h session needed)."""
     payload = {
         "channels": [
@@ -404,11 +422,25 @@ def do_send_template(number: str, template_name: str, template_params: dict | No
         ],
         "message": f"[template:{template_name}]",
     }
+    if force:
+        payload["resend"] = True
     if template_params:
         payload["channels"][0]["template_params"] = [
             {"name": k, "value": v} for k, v in template_params.items()
         ]
     code, body = http("POST", "/api/v1/notifications/send", payload)
+    if body.get("duplicate") and not force:
+        print(body.get("message") or "This message was already sent. Do you want to resend?")
+        print(f"Existing message id: {body.get('message_id', '?')} (status: {body.get('status', '?')})")
+        try:
+            answer = input("Do you want to resend? (y/n): ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer == "y":
+            payload["resend"] = True
+            code, body = http("POST", "/api/v1/notifications/send", payload)
+        else:
+            return
     if code != 202 or not body.get("message_id"):
         detail = body.get("error", body.get("detail", body))
         if isinstance(detail, dict):
@@ -566,7 +598,13 @@ def main() -> None:
         ensure_server()
         template = ""
         params: dict | None = None
+        force = False
         filtered = list(rest)
+        if "--resend" in filtered or "--force" in filtered or "--force-resend" in filtered:
+            force = True
+            for flag in ("--resend", "--force", "--force-resend"):
+                while flag in filtered:
+                    filtered.remove(flag)
         if "--template" in filtered:
             i = filtered.index("--template")
             if i + 1 < len(filtered):
@@ -583,14 +621,15 @@ def main() -> None:
                 else:
                     break
         channels = [c.strip() for c in filtered[0].split(",") if c.strip()]
-        do_send([(c, filtered[1]) for c in channels], filtered[2], template=template, template_params=params)
+        do_send([(c, filtered[1]) for c in channels], filtered[2], template=template, template_params=params, force=force)
     elif cmd in ("send-template", "send_template", "sendwhatsapptemplate") and len(rest) >= 2:
         ensure_server()
         number = rest[0]
         template_name = rest[1]
+        force = "--resend" in rest or "--force" in rest or "--force-resend" in rest
         # optional --param name=value (repeatable)
         params: dict | None = None
-        tail = list(rest[2:])
+        tail = [a for a in rest[2:] if a not in ("--resend", "--force", "--force-resend")]
         if "--param" in tail:
             params = {}
             i = tail.index("--param")
@@ -601,7 +640,7 @@ def main() -> None:
                     del tail[i:i + 2]
                 else:
                     break
-        do_send_template(number, template_name, template_params=params)
+        do_send_template(number, template_name, template_params=params, force=force)
     elif cmd == "status" and rest:
         ensure_server()
         do_status(rest[0])
@@ -720,11 +759,25 @@ _LOG_COLORS = {
     "ERROR": "[31m",
     "CRITICAL": "[35m[1m",
 }
+# Levels that colour the ENTIRE line so problems stand out in `logs` output.
+_LOG_LINE_COLORS = {
+    "WARNING": "[33m",
+    "ERROR": "[31m",
+    "CRITICAL": "[35m[1m",
+}
 _LOG_RESET = "[0m"
 
 
 def _colorize_log_line(line: str) -> str:
-    """Add ANSI colour to the level token in a log line."""
+    """Colour a log line read from the file for terminal display.
+
+    Warning/error/critical lines are coloured entirely (yellow/red/magenta)
+    so they stand out; other levels just colour the level token.
+    """
+    for tok, code in _LOG_LINE_COLORS.items():
+        needle = f" {tok} "
+        if needle in line or line.startswith(tok + " "):
+            return f"{code}{line}{_LOG_RESET}"
     for tok, code in _LOG_COLORS.items():
         needle = f" {tok} "
         if needle in line:
