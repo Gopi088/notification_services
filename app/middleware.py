@@ -8,8 +8,9 @@ headers are honoured. The id is echoed back in the response header.
 Logs every request on arrival and completion with:
   method, path, client IP, status code, duration in ms
 
-Also contains a sliding-window rate limiter keyed by API key hash.
+Also contains a sliding-window rate limiter with throttling.
 """
+import asyncio
 import collections
 import contextvars
 import logging
@@ -58,7 +59,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
         if elapsed_ms > 1000:
             logger.warning(
-                "%s %s completed with status=%d in %.1fms (SLOW)",
+                "%s %s completed with status=%d in %.1ms (SLOW)",
                 method, path, status, elapsed_ms,
                 extra=extra,
             )
@@ -86,22 +87,21 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 
 # ---------------------------------------------------------------------------
-# Sliding-window rate limiter (per API key hash)
+# Sliding-window rate limiter with THROTTLING (per API key hash)
 # ---------------------------------------------------------------------------
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """
-    Sliding window rate limiter.
+    Sliding window rate limiter with throttling.
 
-    Each API key hash (or "anonymous" when AUTH_ENABLED=false) gets a
-    deque of timestamps.  When the number of requests in the window
-    exceeds the limit, the request is rejected with 429.
+    - Requests within limit: processed immediately
+    - Requests over limit: DELAYED (throttled) but still processed
+    - Delay increases with each extra request: 0.1s, 0.2s, 0.3s...
 
-    The rate limit is taken from the per-key override (api_keys table)
-    or falls back to settings.RATE_LIMIT_DEFAULT_PER_SECOND.
+    Each API key hash gets its own independent window.
     """
 
-    def __init__(self, app, default_per_second: int = 10, window_seconds: int = 60):
+    def __init__(self, app, default_per_second: int = 10, window_seconds: int = 1):
         super().__init__(app)
         self.default_per_second = default_per_second
         self.window_seconds = window_seconds
@@ -117,9 +117,10 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 return record["rate_limit_per_second"]
         return self.default_per_second
 
-    def _check_and_record(self, key_hash: str, limit: int) -> tuple[bool, int]:
+    def _check_and_throttle(self, key_hash: str, limit: int) -> tuple[int, int, float]:
         """
-        Returns (allowed, remaining).  Updates the sliding window.
+        Returns (remaining, total_limit, delay_seconds).
+        Updates the sliding window and calculates throttle delay.
         """
         now = time.monotonic()
         window_start = now - self.window_seconds
@@ -134,13 +135,20 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
             timestamps.popleft()
 
         max_requests = limit * self.window_seconds
-        if len(timestamps) >= max_requests:
-            remaining = 0
-            return False, remaining
+        current_count = len(timestamps)
 
+        # Calculate delay if over limit
+        if current_count >= max_requests:
+            excess = current_count - max_requests + 1
+            delay = excess * 0.1  # 0.1s per extra request
+        else:
+            delay = 0.0
+
+        # Record this request
         timestamps.append(now)
-        remaining = max_requests - len(timestamps)
-        return True, remaining
+        remaining = max(0, max_requests - len(timestamps))
+
+        return remaining, max_requests, delay
 
     async def dispatch(self, request: Request, call_next) -> Response:
         # Only rate-limit POST /api/v1/notifications/send
@@ -152,43 +160,40 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
         # Use API key hash if provided, otherwise use anonymous identifier
         x_api_key = request.headers.get("x-api-key", "")
+        authorization = request.headers.get("authorization", "")
+
         if x_api_key:
             from app.database import hash_api_key
             key_hash = hash_api_key(x_api_key)
+        elif authorization.startswith("Bearer "):
+            # Extract client name from JWT token for rate limiting
+            try:
+                import jwt
+                token = authorization[7:]
+                payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+                key_hash = f"oauth:{payload.get('sub', 'unknown')}"
+            except Exception:
+                key_hash = "anonymous"
         else:
             key_hash = "anonymous"
-        limit = self._get_limit(key_hash)
-        allowed, remaining = self._check_and_record(key_hash, limit)
 
-        if not allowed:
-            from app.audit import record as audit_record
-            from starlette.responses import JSONResponse
-            audit_record(
-                action="rate_limit.exceeded",
-                outcome="denied",
-                detail={"limit_per_second": limit, "window_seconds": self.window_seconds},
-            )
+        limit = self._get_limit(key_hash)
+        remaining, total_limit, delay = self._check_and_throttle(key_hash, limit)
+
+        # Apply throttle delay if needed
+        if delay > 0:
             logger.warning(
-                "Rate limit exceeded: key_hash=%s limit=%d/sec",
-                key_hash[:12], limit,
+                "Throttling request: key=%s delay=%.1fs (over limit by %d)",
+                key_hash[:16], delay, int(delay / 0.1),
+                extra={"method": "POST", "path": "/api/v1/notifications/send",
+                       "status_code": 200, "duration_ms": delay * 1000},
             )
-            return JSONResponse(
-                status_code=429,
-                content={
-                    "success": False,
-                    "error": {
-                        "code": "rate_limited",
-                        "message": f"Rate limit exceeded. Max {limit} requests per second.",
-                        "field": None,
-                    },
-                },
-                headers={
-                    "X-RateLimit-Limit": str(limit * self.window_seconds),
-                    "X-RateLimit-Remaining": "0",
-                },
-            )
+            await asyncio.sleep(delay)
 
         response = await call_next(request)
-        response.headers["X-RateLimit-Limit"] = str(limit * self.window_seconds)
+        response.headers["X-RateLimit-Limit"] = str(total_limit)
         response.headers["X-RateLimit-Remaining"] = str(remaining)
+        response.headers["X-RateLimit-Throttled"] = "true" if delay > 0 else "false"
+        if delay > 0:
+            response.headers["X-RateLimit-Delay"] = f"{delay:.1f}s"
         return response

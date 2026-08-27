@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     AUTH_ENABLED: bool = False
     AUTH_API_KEY: str = ""
 
+    # --- OAuth2 / JWT ---
+    JWT_SECRET: str = "super-secret-key-change-in-production"
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRY_MINUTES: int = 60
+
     # --- Authorization ---
     # When AUTH_ENABLED=true, scopes are checked per API key.
     # Scopes are stored in the api_keys table as a JSON array.

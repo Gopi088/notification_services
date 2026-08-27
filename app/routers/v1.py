@@ -5,8 +5,11 @@ Single channel per request. One send = one channel = one contact.
 Supports Idempotency-Key header for exactly-once semantics.
 """
 import logging
+import time
 
+import jwt
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, Query
+from pydantic import BaseModel
 
 from app import __version__
 from app.audit import list_audit, record as audit_record
@@ -288,3 +291,93 @@ def revoke_key(key_hash: str) -> dict:
     )
     logger.info("Revoked API key: hash=%s", key_hash[:16])
     return {"success": True, "message": "API key revoked."}
+
+
+# ---------------------------------------------------------------------------
+# OAuth Token Endpoint
+# ---------------------------------------------------------------------------
+
+class TokenRequest(BaseModel):
+    client_id: str
+    client_secret: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    scope: str
+
+
+@router.post(
+    "/auth/token",
+    summary="OAuth token endpoint - exchange client credentials for JWT token",
+    response_model=TokenResponse,
+)
+def get_token(payload: TokenRequest):
+    """
+    OAuth flow:
+    1. Client sends client_id + client_secret
+    2. Server validates credentials against api_keys table
+    3. Server returns JWT token with expiry and scopes
+    4. Client uses token in Authorization: Bearer <token> header
+    """
+    from app.database import hash_api_key, get_api_key
+
+    key_hash = hash_api_key(payload.client_secret)
+    key_record = get_api_key(key_hash)
+
+    if key_record is None:
+        logger.warning("OAuth token failed: invalid client_id=%s", payload.client_id)
+        _audit_auth_failure("OAuth: invalid credentials")
+        from app.errors import UnauthorizedError
+        raise UnauthorizedError("Invalid client_id or client_secret.")
+
+    if key_record.get("name") != payload.client_id:
+        logger.warning("OAuth token failed: client_id mismatch")
+        _audit_auth_failure("OAuth: client_id mismatch")
+        from app.errors import UnauthorizedError
+        raise UnauthorizedError("Invalid client_id or client_secret.")
+
+    if not key_record.get("is_active", False):
+        logger.warning("OAuth token failed: revoked key")
+        _audit_auth_failure("OAuth: revoked key")
+        from app.errors import UnauthorizedError
+        raise UnauthorizedError("Client credentials have been revoked.")
+
+    settings = get_settings()
+    scopes = key_record.get("scopes", [])
+    now = int(time.time())
+    expiry_minutes = settings.JWT_EXPIRY_MINUTES
+
+    token_payload = {
+        "sub": key_record.get("name"),
+        "tenant_id": key_record.get("tenant_id"),
+        "scopes": scopes,
+        "iat": now,
+        "exp": now + (expiry_minutes * 60),
+    }
+
+    token = jwt.encode(token_payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
+
+    audit_record(
+        action="oauth.token.issue",
+        outcome="success",
+        detail={"client_id": payload.client_id, "scopes": scopes},
+    )
+    logger.info("OAuth token issued: client=%s scopes=%s", payload.client_id, scopes)
+
+    return TokenResponse(
+        access_token=token,
+        token_type="bearer",
+        expires_in=expiry_minutes * 60,
+        scope=" ".join(scopes),
+    )
+
+
+def _audit_auth_failure(reason: str) -> None:
+    from app.audit import record as audit_record
+    audit_record(
+        action="auth.failure",
+        outcome="denied",
+        detail={"reason": reason},
+    )

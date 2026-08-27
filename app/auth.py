@@ -1,25 +1,24 @@
 """
-Multi-key API authentication with DB-backed key store.
+OAuth-style authentication with Bearer tokens + API key fallback.
 
-When AUTH_ENABLED=true every /api/v1 request must include the header:
+Two ways to authenticate:
 
-    X-API-Key: <key>
+1. OAuth Bearer Token (primary):
+   - POST /api/v1/auth/token with client_id + client_secret
+   - Receive JWT access_token
+   - Send header: Authorization: Bearer <token>
 
-The key is SHA-256 hashed and looked up in the api_keys table.  Each key
-carries metadata used by downstream middleware:
+2. API Key (legacy fallback):
+   - Send header: X-API-Key: <key>
 
-    - tenant_id       (for future multi-tenant isolation)
-    - scopes          (for Phase 4 authorization)
-    - rate_limit_per_second (for Phase 5 rate limiting)
-    - is_active / expires_at (for key lifecycle)
-
-A dataclass `APIKeyContext` is stored on request.state so routers and
-middleware can access the authenticated identity without re-querying.
+Both methods validate credentials against the api_keys table.
+Scopes are embedded in JWT tokens for authorization checks.
 """
 import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
+import jwt
 from fastapi import Header, Request
 
 from app.config import get_settings
@@ -41,23 +40,89 @@ class APIKeyContext:
     rate_limit_per_second: Optional[int]
 
 
-def require_api_key(request: Request, x_api_key: str = Header(default="")) -> None:
+def require_api_key(
+    request: Request,
+    authorization: str = Header(default=""),
+    x_api_key: str = Header(default=""),
+) -> None:
     """
-    FastAPI dependency (used in ``dependencies=[...]``).
+    FastAPI dependency — validates either OAuth Bearer token or API key.
 
-    Stores an ``APIKeyContext`` on ``request.state.api_key_ctx`` when
-    auth is enabled and the key is valid.  Returns None in all cases;
-    scope checks are handled by ``require_scope``.
+    Priority:
+    1. Authorization: Bearer <jwt_token>  (OAuth flow)
+    2. X-API-Key: <raw_key>               (legacy flow)
     """
     settings = get_settings()
     if not settings.AUTH_ENABLED:
         return
 
-    if not x_api_key:
-        logger.warning("Auth failed: missing X-API-Key header")
-        _audit_auth_failure("Missing X-API-Key header")
-        raise UnauthorizedError("Missing X-API-Key header.")
+    # --- Try OAuth Bearer token first ---
+    if authorization.startswith("Bearer "):
+        token = authorization[7:]
+        _validate_bearer_token(request, token)
+        return
 
+    # --- Fallback to API key ---
+    if x_api_key:
+        _validate_api_key(request, x_api_key)
+        return
+
+    # --- No credentials ---
+    logger.warning("Auth failed: no credentials provided")
+    _audit_auth_failure("Missing credentials (no Bearer token or X-API-Key)")
+    raise UnauthorizedError("Authentication required. Provide Authorization: Bearer <token> or X-API-Key header.")
+
+
+def _validate_bearer_token(request: Request, token: str) -> None:
+    """Validate a JWT Bearer token and set request context."""
+    settings = get_settings()
+
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        logger.warning("Auth failed: token expired")
+        _audit_auth_failure("OAuth: expired token")
+        raise UnauthorizedError("Token has expired. Request a new one via /auth/token.")
+    except jwt.InvalidTokenError:
+        logger.warning("Auth failed: invalid token")
+        _audit_auth_failure("OAuth: invalid token")
+        raise UnauthorizedError("Invalid token.")
+
+    # Look up the key record to check if still active
+    client_name = payload.get("sub", "")
+    key_hash = hash_api_key(settings.AUTH_API_KEY)  # We verify against stored keys
+    key_record = None
+
+    # Find key by name
+    from app.database import list_api_keys
+    all_keys = list_api_keys()
+    for k in all_keys:
+        if k.get("name") == client_name:
+            key_record = k
+            break
+
+    if key_record and not key_record.get("is_active", True):
+        logger.warning("Auth failed: key revoked (client=%s)", client_name)
+        _audit_auth_failure("OAuth: revoked key")
+        raise UnauthorizedError("Client credentials have been revoked.")
+
+    ctx = APIKeyContext(
+        key_hash=key_record.get("key_hash", "") if key_record else "",
+        name=client_name,
+        tenant_id=payload.get("tenant_id", ""),
+        scopes=payload.get("scopes", []),
+        rate_limit_per_second=key_record.get("rate_limit_per_second") if key_record else None,
+    )
+
+    logger.info(
+        "OAuth auth passed: client=%s tenant=%s scopes=%s",
+        ctx.name, ctx.tenant_id, ctx.scopes,
+    )
+    request.state.api_key_ctx = ctx
+
+
+def _validate_api_key(request: Request, x_api_key: str) -> None:
+    """Validate an API key (legacy flow) and set request context."""
     key_hash = hash_api_key(x_api_key)
     key_record = get_api_key(key_hash)
 
@@ -94,7 +159,7 @@ def require_api_key(request: Request, x_api_key: str = Header(default="")) -> No
     )
 
     logger.info(
-        "Auth passed: key=%s tenant=%s scopes=%s",
+        "API key auth passed: key=%s tenant=%s scopes=%s",
         ctx.name, ctx.tenant_id, ctx.scopes,
     )
     request.state.api_key_ctx = ctx
@@ -115,7 +180,7 @@ def _audit_auth_failure(reason: str) -> None:
 
 def require_scope(*required_scopes: str):
     """
-    Returns a FastAPI dependency that asserts the authenticated API key
+    Returns a FastAPI dependency that asserts the authenticated client
     holds at least one of the given scopes.
 
     Usage::
@@ -132,7 +197,7 @@ def require_scope(*required_scopes: str):
             return
         if not any(s in ctx.scopes for s in required_scopes):
             logger.warning(
-                "Authz failed: key=%s tenant=%s required=%s have=%s",
+                "Authz failed: client=%s tenant=%s required=%s have=%s",
                 ctx.name, ctx.tenant_id, required_scopes, ctx.scopes,
             )
             from app.audit import record as audit_record

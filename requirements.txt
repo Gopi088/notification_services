@@ -10,3 +10,4 @@ vonage==4.8.2
 vonage-messages==1.7.1
 tenacity>=8.0.0
 pytest>=8.0.0
+PyJWT>=2.8.0
