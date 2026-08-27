@@ -40,8 +40,7 @@ def client(_isolated_db):
     get_settings.cache_clear()
 
     from app.main import app
-    with patch("app.workers.start_workers"), \
-         patch("app.workers.stop_workers", return_value=None), \
+    with patch("app.main.worker_manager") as mock_wm, \
          patch("app.database.reset_stale_processing", return_value=0), \
          patch("app.database.cleanup_expired_idempotency", return_value=0):
         with TestClient(app, raise_server_exceptions=False) as c:
@@ -68,8 +67,7 @@ def auth_client(_isolated_db):
     )
 
     from app.main import app
-    with patch("app.workers.start_workers"), \
-         patch("app.workers.stop_workers", return_value=None), \
+    with patch("app.main.worker_manager") as mock_wm, \
          patch("app.database.reset_stale_processing", return_value=0), \
          patch("app.database.cleanup_expired_idempotency", return_value=0):
         with TestClient(app, raise_server_exceptions=False) as c:
@@ -96,8 +94,7 @@ def readonly_auth_client(_isolated_db):
     )
 
     from app.main import app
-    with patch("app.workers.start_workers"), \
-         patch("app.workers.stop_workers", return_value=None), \
+    with patch("app.main.worker_manager") as mock_wm, \
          patch("app.database.reset_stale_processing", return_value=0), \
          patch("app.database.cleanup_expired_idempotency", return_value=0):
         with TestClient(app, raise_server_exceptions=False) as c:
@@ -125,8 +122,7 @@ def rate_limited_auth_client(_isolated_db):
     )
 
     from app.main import app
-    with patch("app.workers.start_workers"), \
-         patch("app.workers.stop_workers", return_value=None), \
+    with patch("app.main.worker_manager") as mock_wm, \
          patch("app.database.reset_stale_processing", return_value=0), \
          patch("app.database.cleanup_expired_idempotency", return_value=0):
         with TestClient(app, raise_server_exceptions=False) as c:

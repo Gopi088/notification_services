@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     RETRY_BACKOFF_BASE_SECONDS: float = 0.5
     RETRY_BACKOFF_MAX_SECONDS: float = 30.0
 
-    # --- Workers (asyncio queue) ---
+    # --- Workers (thread pool) ---
     WORKER_COUNT: int = 3
 
     # --- Vonage SMS (alternative SMS provider to Azure) ---

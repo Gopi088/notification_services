@@ -73,8 +73,7 @@ class TestAuthEnabled:
         from unittest.mock import patch
         from app.main import app
         from fastapi.testclient import TestClient
-        with patch("app.workers.start_workers"), \
-             patch("app.workers.stop_workers", return_value=None), \
+        with patch("app.main.worker_manager"), \
              patch("app.database.reset_stale_processing", return_value=0), \
              patch("app.database.cleanup_expired_idempotency", return_value=0):
             with TestClient(app, raise_server_exceptions=False) as c:

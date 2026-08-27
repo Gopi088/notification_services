@@ -119,7 +119,7 @@ async def send(
         extra={"channel": payload.channel.value},
     )
 
-    summary = await orchestrate_send(payload, background_tasks)
+    summary = orchestrate_send(payload, background_tasks)
 
     response = SendResponse(
         success=True,

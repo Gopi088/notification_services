@@ -48,7 +48,7 @@ async def send_message(payload: LegacySendRequest, background_tasks: BackgroundT
     except ContactValidationError as exc:
         raise ValidationError(str(exc), field="contact") from exc
 
-    summary = await orchestrate_send(
+    summary = orchestrate_send(
         V1SendRequest(
             channel=payload.channel,
             contact=payload.contact,

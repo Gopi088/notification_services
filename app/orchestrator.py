@@ -1,11 +1,11 @@
 """
 Notification orchestrator.
 
-Single channel per request. Uses asyncio queue for async processing.
+Single channel per request. Uses a thread-safe queue for background processing.
 
 Flow:
 1. API receives request → validates → creates DB record → puts in queue
-2. Workers pick from queue → call provider → update DB status
+2. Worker threads pick from queue → call provider → update DB status
 """
 import logging
 import uuid
@@ -21,13 +21,13 @@ from app.schemas import Channel, SendRequest
 logger = logging.getLogger("orchestrator")
 
 
-async def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
+def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
     """
     Send a notification on ONE channel.
 
     Flow:
     1. Create DB record (status: queued)
-    2. Put in queue for workers
+    2. Put in queue for worker threads
     3. Return immediately
 
     Returns the message summary used for the 202 response.
@@ -86,7 +86,7 @@ async def orchestrate_send(req: SendRequest, background_tasks) -> Dict:
         template_params=params,
         request_id=rid,
     )
-    await message_queue.put(item)
+    message_queue.put(item)
     logger.info(
         "Enqueued for worker processing: message_id=%s",
         message_id,

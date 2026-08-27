@@ -20,7 +20,7 @@ from app.queue import message_queue
 from app.routers.notifications import router as legacy_router
 from app.routers.v1 import router as v1_router
 from app.routers.webhooks import router as webhook_router
-from app.workers import start_workers, stop_workers
+from app.workers import worker_manager
 
 settings = get_settings()
 
@@ -83,7 +83,7 @@ app.add_middleware(RequestIDMiddleware)
 app.add_middleware(
     RateLimitMiddleware,
     default_per_second=settings.RATE_LIMIT_DEFAULT_PER_SECOND,
-    window_seconds=60,
+    window_seconds=1,
 )
 
 
@@ -93,7 +93,7 @@ def on_startup() -> None:
     init_db()
     stale_reset = reset_stale_processing(settings.WORKER_STALE_TIMEOUT_MINUTES)
     expired_cleaned = cleanup_expired_idempotency()
-    start_workers(settings.WORKER_COUNT)
+    worker_manager.start(settings.WORKER_COUNT)
     logger.info(
         "Server started: mock_mode=%s version=%s workers=%d stale_reset=%d idempotency_cleaned=%d log_level=%s log_format=%s",
         settings.MOCK_MODE, __version__, settings.WORKER_COUNT,
@@ -104,12 +104,7 @@ def on_startup() -> None:
 
 @app.on_event("shutdown")
 def on_shutdown() -> None:
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-        loop.run_until_complete(stop_workers())
-    except RuntimeError:
-        pass
+    worker_manager.stop()
     logger.info("Server shutting down")
 
 
