@@ -38,6 +38,8 @@ AUDIT_EVENTS = {
     "notification_processing",
     "notification_sent",
     "notification_delivered",
+    "notification_read",
+    "notification_acknowledged",
     "notification_failed",
     "notification_retrying",
     "notification_cancelled",
@@ -64,6 +66,11 @@ AUDIT_EVENTS = {
     "provider_webhook_rejected",
     "user_response_received",
     "notification_status_queried",
+    "status_changed",
+    "login_succeeded",
+    "login_failed",
+    "authentication_failed",
+    "candidate_report_queried",
 }
 
 

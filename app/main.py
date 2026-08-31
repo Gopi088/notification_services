@@ -13,12 +13,14 @@ from fastapi.responses import JSONResponse
 
 from app import __version__
 from app.config import get_settings
-from app.auth import require_api_key
+from app.auth import require_auth
 from app.logging_config import configure_logging
+from app.routers.auth import router as auth_router
 from app.routers.notifications import router as legacy_router
 from app.routers.v1 import router as v1_router
 from app.routers.webhooks import router as webhook_router
 from app.routers.inbound import router as inbound_router
+from app.routers.twilio_webhooks import router as twilio_webhook_router
 from app.storage import get_storage
 
 configure_logging()
@@ -37,6 +39,33 @@ app = FastAPI(
 def on_startup() -> None:
     logger.info("application startup version=%s mock_mode=%s storage=%s queue=%s",
                 __version__, settings.MOCK_MODE, settings.STORAGE_BACKEND, settings.QUEUE_ENABLED)
+    # Warn loudly when authentication is disabled - /api/v1/* routes then work
+    # without a Bearer token. In production AUTH_ENABLED must be true.
+    s = get_settings()
+    if not s.AUTH_ENABLED and not s.MOCK_MODE:
+        logger.warning(
+            "AUTH_ENABLED=false: /api/v1/* routes are NOT authenticated. Set "
+            "AUTH_ENABLED=true, JWT_SECRET_KEY and dev credentials to require "
+            "Authorization: Bearer <JWT>."
+        )
+    # Warn loudly when delivery callbacks are missing - otherwise SMS/WhatsApp
+    # stay "submitted" forever because the provider is never told where to
+    # post delivery status.
+    twilio_active = bool(s.TWILIO_ACCOUNT_SID and s.TWILIO_AUTH_TOKEN)
+    if twilio_active and not s.MOCK_MODE:
+        sms_cb = s.SMS_STATUS_WEBHOOK_URL or s.TWILIO_STATUS_CALLBACK_URL
+        wa_cb = s.WHATSAPP_STATUS_WEBHOOK_URL or s.TWILIO_STATUS_CALLBACK_URL
+        if not sms_cb:
+            logger.warning(
+                "SMS delivery will stay 'submitted': no SMS_STATUS_WEBHOOK_URL (or "
+                "TWILIO_STATUS_CALLBACK_URL) configured. Set it to a public URL "
+                "(e.g. ngrok https://.../api/v1/sms/webhook) to receive Twilio callbacks."
+            )
+        if not wa_cb:
+            logger.warning(
+                "WhatsApp delivery will stay 'submitted': no WHATSAPP_STATUS_WEBHOOK_URL "
+                "(or TWILIO_STATUS_CALLBACK_URL) configured."
+            )
     # Initialize durable storage (source of truth) + schema.
     get_storage()
     # Run migrations on every backend. This upgrades an existing local SQLite
@@ -131,11 +160,20 @@ def unhandled_exception_handler(request: Request, exc: Exception) -> JSONRespons
 
 
 # Versioned public API (recommended)
-app.include_router(v1_router, dependencies=[Depends(require_api_key)])
+# Client auth (JWT login) - intentionally NOT behind the auth dependency.
+app.include_router(auth_router)
 
-# Legacy unversioned routes (kept for backward compatibility)
-# Legacy `/send` and `/status` stay public for local CLI and Postman use.
-app.include_router(legacy_router)
+# Public health (exempt from JWT so load balancers / probes can reach it).
+@app.get("/api/v1/health", summary="Service health (public)")
+def api_health() -> dict:
+    return {"service": settings.APP_NAME, "version": __version__, "mock_mode": settings.MOCK_MODE}
+
+app.include_router(v1_router, dependencies=[Depends(require_auth)])
+
+# Legacy unversioned routes (kept for backward compatibility). They map onto
+# the same send pipeline and are protected by the same JWT dependency so the
+# auth cannot be bypassed through alternate routes.
+app.include_router(legacy_router, dependencies=[Depends(require_auth)])
 
 
 # Delivery-receipt webhook (Azure Event Grid)
@@ -143,6 +181,9 @@ app.include_router(webhook_router)
 
 # Inbound (reply) webhook - recipients replying to notifications
 app.include_router(inbound_router)
+
+# Twilio delivery-status webhook (SMS + WhatsApp)
+app.include_router(twilio_webhook_router)
 
 
 @app.get("/health", summary="Liveness: process is up")

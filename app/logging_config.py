@@ -220,6 +220,27 @@ def configure_logging() -> None:
     root.setLevel(logging.DEBUG)  # allow everything upstream; handlers filter
     root.handlers = []
 
+    # Library loggers that flood normal INFO output with SDK HTTP diagnostics
+    # (Azure pipeline policies, urllib3 connection pool, httpx/httpcore).
+    # At INFO (or quieter) they are suppressed to WARNING; at DEBUG they stay
+    # verbose so full SDK diagnostics are available when troubleshooting.
+    noisy_libraries = (
+        "azure", "azure.core", "azure.core.pipeline",
+        "azure.core.pipeline.policies", "azure.identity",
+        "urllib3", "requests", "httpx", "httpcore", "msrest", "msal",
+    )
+    lib_level = logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    for lib_name in noisy_libraries:
+        lib_logger = logging.getLogger(lib_name)
+        lib_logger.setLevel(lib_level)
+        lib_logger.propagate = True
+
+    # The Azure HTTP logging policy dumps every request/response body + headers
+    # and is extremely noisy even at DEBUG. Keep it at WARNING always so the
+    # terminal stays readable; connection-level urllib3/azure logs above remain
+    # available for troubleshooting.
+    logging.getLogger("azure.core.pipeline.policies.http_logging_policy").setLevel(logging.WARNING)
+
     # Terminal handler: exact-level filter applied here.
     stdout = logging.StreamHandler(sys.stdout)
     stdout.setFormatter(formatter)

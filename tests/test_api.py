@@ -2,6 +2,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from app.providers.base import ProviderResult
 
 
@@ -9,6 +11,74 @@ def test_health(client):
     r = client.get("/health")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+@pytest.mark.parametrize("raw_channel,canonical,contact", [
+    ("sms", "sms", "+919887270348"), ("SMS", "sms", "+919887270348"), (" Sms ", "sms", "+919887270348"),
+    ("email", "email", "you@example.com"), ("EMAIL", "email", "you@example.com"), ("Email", "email", "you@example.com"),
+    ("whatsapp", "whatsapp", "+919887270348"), ("WhatsApp", "whatsapp", "+919887270348"), (" WHATSAPP ", "whatsapp", "+919887270348"),
+])
+def test_channel_case_insensitive(client, raw_channel, canonical, contact):
+    """Channel input is trimmed + case-insensitive; resolves to the same channel."""
+    from unittest.mock import patch
+
+    from app.providers.base import ProviderResult
+
+    with patch("app.providers.vonage_provider.VonageSMSProvider.send") as fake_sms, \
+         patch("app.providers.vonage_provider.VonageWhatsAppProvider.send") as fake_wa, \
+         patch("app.providers.azure_provider.AzureEmailProvider.send") as fake_email:
+        fake_sms.return_value = ProviderResult("vonage_sms", "m-ch-sms", "submitted")
+        fake_wa.return_value = ProviderResult("vonage_whatsapp", "m-ch-wa", "submitted")
+        fake_email.return_value = ProviderResult("azure_email", "m-ch-em", "submitted")
+        r = client.post("/api/v1/notifications/send",
+                        json={"channels": [{"channel": raw_channel, "contact": contact}],
+                              "message": "channel case test"})
+    assert r.status_code == 202
+    body = r.json()
+    assert body["channels"][0]["channel"] == canonical
+    # The provider for the canonical channel was used.
+    if canonical == "sms":
+        assert fake_sms.call_count == 1
+    elif canonical == "whatsapp":
+        assert fake_wa.call_count == 1
+    else:
+        assert fake_email.call_count == 1
+
+
+def test_unsupported_channel_validation_error(client):
+    """An unsupported channel is a clear 422 validation error."""
+    r = client.post("/api/v1/notifications/send",
+                    json={"channels": [{"channel": "telegram", "contact": "+919887270348"}],
+                          "message": "nope"})
+    assert r.status_code == 422
+
+
+def test_legacy_send_duplicate_detection(client):
+    """The legacy /send endpoint detects duplicates within the window."""
+    import time
+
+    from app.providers.base import ProviderResult
+
+    with patch("app.providers.vonage_provider.VonageSMSProvider.send") as fake:
+        fake.return_value = ProviderResult("vonage_sms", "m-legacy-dup", "submitted")
+        r1 = client.post("/send", json={"channel": "sms", "contact": "+919887270348",
+                                        "message": "legacy dup"})
+        time.sleep(0.2)
+        r2 = client.post("/send", json={"channel": "sms", "contact": "+919887270348",
+                                        "message": "legacy dup"})
+        r3 = client.post("/send", json={"channel": "sms", "contact": "+919887270348",
+                                        "message": "different"})
+    assert r1.status_code == 202
+    assert r2.status_code == 202
+    body = r2.json()
+    detail = body.get("detail", body)
+    assert detail.get("duplicate") is True
+    assert detail.get("message") == "Message already sent recently. Resend?"
+    assert detail.get("message_id") == r1.json()["message_id"]
+    # Different message -> new send.
+    assert r3.status_code == 202
+    assert r3.json()["message_id"] != r1.json()["message_id"]
+    assert fake.call_count == 2  # only first + different message sent
 
 
 def test_readiness(client):
@@ -108,6 +178,54 @@ def test_status_flow(client, storage):
 def test_status_not_found(client):
     r = client.get("/api/v1/notifications/nonexistent/status")
     assert r.status_code == 404
+
+
+def test_status_returns_retry_count_and_delivered_at(client, storage):
+    """Status API exposes retry_count, delivered_at, read_at, error, provider."""
+    import uuid
+
+    mid = str(uuid.uuid4())
+    nid = storage.create_notification(
+        message_id=mid, channel="sms", recipient="+919887270348",
+        message="hi", status="queued",
+    )
+    storage.transition(nid, "processing", actor="worker")
+    storage.transition(nid, "submitted", actor="worker",
+                       provider="vonage_sms", provider_message_id="pm-1")
+    r = client.get(f"/api/v1/notifications/{mid}/status")
+    assert r.status_code == 200
+    ch = r.json()["channels"][0]
+    assert ch["status"] == "submitted"
+    assert ch["provider"] == "vonage_sms"
+    assert ch["provider_message_id"] == "pm-1"
+    assert ch["retry_count"] == 0
+    # Delivered_at appears (None until the webhook confirms delivery).
+    assert "delivered_at" in ch
+
+
+def test_status_polling_is_idempotent(client, storage):
+    """Repeated GET status returns the latest persisted status without
+    creating duplicate records or changing state."""
+    import uuid
+
+    mid = str(uuid.uuid4())
+    storage.create_notification(
+        message_id=mid, channel="whatsapp", recipient="+919887270348",
+        message="hi", status="submitted",
+    )
+    before = storage.get_notification_by_message_id(mid)
+    r1 = client.get(f"/api/v1/notifications/{mid}/status")
+    r2 = client.get(f"/api/v1/notifications/{mid}/status")
+    r3 = client.get(f"/api/v1/notifications/{mid}/status")
+    assert r1.status_code == r2.status_code == r3.status_code == 200
+    for r in (r1, r2, r3):
+        ch = r.json()["channels"][0]
+        assert ch["status"] == "submitted"
+        assert ch["message_id"] == mid
+    # State never changes from a GET (updated_at identical, no new records).
+    after = storage.get_notification_by_message_id(mid)
+    assert after["status"] == before["status"] == "submitted"
+    assert after["updated_at"] == before["updated_at"]
 
 
 def test_event_valid(client):
@@ -281,7 +399,7 @@ def test_duplicate_response_has_clear_message_and_flag(client):
     assert r2.status_code == 202
     body = r2.json()
     assert body["duplicate"] is True
-    assert body["message"] == "This message was already sent recently. Do you want to resend?"
+    assert body["message"] == "Message already sent recently. Resend?"
     # The existing message_id is returned, not a new one.
     assert body["message_id"] == r1.json()["channels"][0]["message_id"]
     assert fake.call_count == 1  # provider still called only once
@@ -366,7 +484,7 @@ def test_duplicate_within_window_blocks(client):
     assert r2.status_code == 202
     body = r2.json()
     assert body["duplicate"] is True
-    assert body["message"] == "This message was already sent recently. Do you want to resend?"
+    assert body["message"] == "Message already sent recently. Resend?"
     # Same existing message_id returned - no new notification created.
     assert body["message_id"] == r1.json()["channels"][0]["message_id"]
     assert fake.call_count == 1  # provider NOT called again
@@ -543,6 +661,40 @@ def test_duplicate_window_audit_events(client):
     assert rec["notification_id"]
     assert rec["channel"] == "sms"
     assert "audit window" not in json.dumps(rec)  # message content never logged
+
+
+@pytest.mark.parametrize("window_minutes", [30, 60, 120])
+def test_duplicate_window_configurable(client, monkeypatch, window_minutes):
+    """DUPLICATE_WINDOW_MINUTES is configurable and 30/60/120 all work."""
+    import time
+
+    from unittest.mock import patch
+
+    from app.config import get_settings
+    from app.providers.base import ProviderResult
+
+    monkeypatch.setenv("DUPLICATE_WINDOW_MINUTES", str(window_minutes))
+    get_settings.cache_clear()
+    assert get_settings().DUPLICATE_WINDOW_MINUTES == window_minutes
+
+    with patch("app.providers.vonage_provider.VonageSMSProvider.send") as fake:
+        fake.return_value = ProviderResult("vonage_sms", f"m-{window_minutes}", "submitted")
+        r1 = client.post("/api/v1/notifications/send",
+                         json={"channels": [{"channel": "sms", "contact": "+919887270348"}],
+                               "message": f"window {window_minutes}"},
+                         headers={"X-API-Key": f"win-{window_minutes}"})
+        time.sleep(0.2)
+        r2 = client.post("/api/v1/notifications/send",
+                         json={"channels": [{"channel": "sms", "contact": "+919887270348"}],
+                               "message": f"window {window_minutes}"},
+                         headers={"X-API-Key": f"win-{window_minutes}"})
+    assert r1.status_code == 202
+    assert r2.status_code == 202
+    body = r2.json()
+    assert body["duplicate"] is True
+    assert body["message"] == "Message already sent recently. Resend?"
+    assert body["message_id"] == r1.json()["channels"][0]["message_id"]
+    assert fake.call_count == 1
 
 
 def test_intentional_resend_creates_new(client):

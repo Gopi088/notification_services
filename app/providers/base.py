@@ -70,3 +70,13 @@ class NotificationProvider(ABC):
             payload.get("recipient", ""),
             payload.get("message", ""),
         )
+
+    def poll_status(self, provider_message_id: str) -> Optional[str]:
+        """
+        Query the provider for the current delivery status of a message.
+
+        Returns the raw provider status string (e.g. "delivered", "failed",
+        "sent", "read") or None when the provider does not support polling.
+        Used for on-demand delivery checks when webhooks are unavailable.
+        """
+        return None

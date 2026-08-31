@@ -92,8 +92,7 @@ def test_10_concurrent(client):
         assert r.json()["channels"][0]["status"] == "submitted" or r.json()["channels"][0]["status"] == "queued"
 
     # Audit records exist
-    actions = [a["action"] for a in list_audit(limit=50)]
-    notifications = [a for a in actions if a == "notification_created"]
+    notifications = [a["action"] for a in list_audit(limit=50, action="notification_created")]
     assert len(notifications) == 10, f"audit shows {len(notifications)} created"
 
 
@@ -114,8 +113,7 @@ def test_50_concurrent(client):
     assert len(set(all_ids)) == 50, "duplicate message ids detected"
 
     # Check audit
-    actions = [a["action"] for a in list_audit(limit=200)]
-    notifications = [a for a in actions if a == "notification_created"]
+    notifications = [a["action"] for a in list_audit(limit=200, action="notification_created")]
     assert len(notifications) == 50, f"audit shows {len(notifications)} created"
 
 
@@ -143,8 +141,7 @@ def test_100_concurrent_no_crash(client):
         assert r.status_code == 200, f"status failed for {gid}"
 
     # Audit records all present
-    actions = [a["action"] for a in list_audit(limit=500)]
-    created = [a for a in actions if a == "notification_created"]
+    created = [a["action"] for a in list_audit(limit=500, action="notification_created")]
     assert len(created) == 100, f"audit shows {len(created)} created (expected 100)"
 
     # Timing

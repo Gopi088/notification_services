@@ -172,8 +172,16 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(f"Azure Email error: {exc}") from exc
 
-        message_id = result.get("message_id", "") if isinstance(result, dict) else str(result)
-        return ProviderResult(self.name, message_id, "sent")
+        # The Azure SDK returns the operation result with a message_id /
+        # operation id. Prefer the result's message_id (most specific), then
+        # the result's id, then fall back to the poller's operation_id used
+        # in delivery-report webhooks.
+        mid = ""
+        if isinstance(result, dict):
+            mid = result.get("message_id") or result.get("id") or ""
+        if not mid:
+            mid = getattr(poller, "operation_id", "") or ""
+        return ProviderResult(self.name, mid, "sent")
 
     @staticmethod
     def _build_attachments(attachments: list) -> list:

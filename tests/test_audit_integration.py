@@ -22,7 +22,7 @@ def fake_redis_client(monkeypatch):
 
 
 def test_webhook_read_status_audit(client, storage):
-    """Webhook 'read' transitions to delivered and is audited."""
+    """Webhook 'read' transitions to read and records notification_read audit."""
     from app.audit import list_audit
 
     pv = f"wh-read-{uuid.uuid4().hex[:8]}"
@@ -36,7 +36,9 @@ def test_webhook_read_status_audit(client, storage):
                            "eventType": "Microsoft.Communication.AdvancedMessageDeliveryStatusUpdated"}])
     assert r.status_code == 200
     row = storage.get_by_provider_message_id(pv)
-    assert row["status"] == "delivered"
+    assert row["status"] == "read"
+    actions = [a["action"] for a in list_audit(limit=30)]
+    assert "notification_read" in actions
 
 
 def test_webhook_unhandled_status(client, storage):
@@ -52,6 +54,92 @@ def test_webhook_unhandled_status(client, storage):
     r = client.post("/api/v1/whatsapp/webhook",
                     json=[{"data": {"channelType": "whatsapp", "messageId": pv, "status": "queued"},
                            "eventType": "Microsoft.Communication.AdvancedMessageDeliveryStatusUpdated"}])
+    assert r.status_code == 200
+
+
+def test_email_delivery_report_webhook_delivered(client, storage):
+    """Azure Email delivery report transitions the email to delivered and
+    stamps delivered_at."""
+    import uuid as _uuid
+
+    from app.audit import list_audit
+
+    pv = f"emailop-{_uuid.uuid4().hex[:8]}"
+    nid = storage.create_notification(
+        message_id=str(_uuid.uuid4()), channel="email", recipient="gopi@example.com",
+        message="x", status="submitted",
+    )
+    storage.set_provider_info(nid, "azure_email", pv)
+    r = client.post("/api/v1/whatsapp/webhook",
+                    json=[{"eventType": "Microsoft.Communication.EmailDeliveryReportReceived",
+                           "data": {"messageId": pv, "status": "Delivered",
+                                    "recipientAddress": "gopi@example.com",
+                                    "senderAddress": "no-reply@example.com"}}])
+    assert r.status_code == 200
+    row = storage.get_notification(nid)
+    assert row["status"] == "delivered"
+    assert row["delivered_at"] is not None
+    actions = [a["action"] for a in list_audit(limit=20)]
+    assert "notification_delivered" in actions
+
+
+def test_email_delivery_report_webhook_failed(client, storage):
+    """Azure Email delivery report with a failed status transitions to failed."""
+    import uuid as _uuid
+
+    from app.audit import list_audit
+
+    pv = f"emailop-fail-{_uuid.uuid4().hex[:8]}"
+    nid = storage.create_notification(
+        message_id=str(_uuid.uuid4()), channel="email", recipient="gopi@example.com",
+        message="x", status="submitted",
+    )
+    storage.set_provider_info(nid, "azure_email", pv)
+    r = client.post("/api/v1/whatsapp/webhook",
+                    json=[{"eventType": "Microsoft.Communication.EmailDeliveryReportReceived",
+                           "data": {"messageId": pv, "status": "Failed",
+                                    "recipientAddress": "gopi@example.com",
+                                    "error": {"code": "550", "message": "mailbox full"}}}])
+    assert r.status_code == 200
+    row = storage.get_notification(nid)
+    assert row["status"] == "failed"
+    assert "550" in row["last_error"]
+    actions = [a["action"] for a in list_audit(limit=20)]
+    assert "notification_failed" in actions
+
+
+def test_email_delivery_report_webhook_bounced_uses_email_endpoint(client, storage):
+    """All terminal non-delivered ACS email reports become failed."""
+    import uuid as _uuid
+
+    provider_message_id = f"emailop-bounce-{_uuid.uuid4().hex[:8]}"
+    notification_id = storage.create_notification(
+        message_id=str(_uuid.uuid4()), channel="email", recipient="gopi@example.com",
+        message="x", status="submitted",
+    )
+    storage.set_provider_info(notification_id, "azure_email", provider_message_id)
+    response = client.post(
+        "/api/v1/email/webhook",
+        json=[{
+            "eventType": "Microsoft.Communication.EmailDeliveryReportReceived",
+            "data": {
+                "messageId": provider_message_id,
+                "status": "Bounced",
+                "deliveryStatusDetails": {"statusMessage": "Recipient does not exist"},
+            },
+        }],
+    )
+    assert response.status_code == 200
+    row = storage.get_notification(notification_id)
+    assert row["status"] == "failed"
+    assert "Recipient does not exist" in row["last_error"]
+
+
+def test_email_delivery_report_unknown_message_ignored(client):
+    """A delivery report for an unknown operation id is recorded, not crashed."""
+    r = client.post("/api/v1/whatsapp/webhook",
+                    json=[{"eventType": "Microsoft.Communication.EmailDeliveryReportReceived",
+                           "data": {"messageId": "doesnotexist", "status": "Delivered"}}])
     assert r.status_code == 200
 
 
@@ -90,7 +178,7 @@ def test_worker_deadletter_produces_audit(storage, fake_redis_client):
                                      "recipient": "+919887270348", "attempt": 1})
     assert ok is True
     actions = [a["action"] for a in list_audit(limit=20)]
-    assert "notification_dead_lettered" in actions
+    assert "notification_failed" in actions
 
 
 def test_worker_duplicate_produces_audit(storage, fake_redis_client):
@@ -168,7 +256,7 @@ def test_audit_whatsapp_channel(client, storage):
 
 
 def test_audit_retry_event(storage, fake_redis_client):
-    """Retryable worker failure produces notification_retrying audit."""
+    """Retryable worker failure produces retry_scheduled audit."""
     from app.audit import list_audit
     from app.worker import process_message
     from app.providers.base import ProviderError
@@ -183,8 +271,39 @@ def test_audit_retry_event(storage, fake_redis_client):
                                      "recipient": "+919887270348", "attempt": 1})
     assert ok is True
     actions = [a["action"] for a in list_audit(limit=20)]
-    assert "notification_retrying" in actions
-    assert "notification_failed" in actions or True  # at least retrying recorded
+    assert "retry_scheduled" in actions
+
+
+def test_audit_processing_and_retry_attempted(storage, fake_redis_client):
+    """Worker records notification_processing and retry_attempted audits."""
+    from app.audit import list_audit
+    from app.worker import process_message
+    from app.providers.base import ProviderError
+
+    nid = storage.create_notification(
+        message_id=str(uuid.uuid4()), channel="sms", recipient="+919887270348",
+        message="hi", status="retrying", max_attempts=3,
+    )
+    with patch("app.providers.vonage_provider.VonageSMSProvider.send") as fake:
+        fake.return_value = ProviderResult("vonage_sms", "m2", "submitted")
+        process_message("sms", {"notification_id": nid, "channel": "sms",
+                                "recipient": "+919887270348", "attempt": 2})
+    actions = [a["action"] for a in list_audit(limit=30)]
+    assert "retry_attempted" in actions
+    assert "notification_processing" in actions
+
+
+def test_audit_acknowledged(storage):
+    """mark_acknowledged records a notification_acknowledged audit event."""
+    from app.audit import list_audit
+
+    nid = storage.create_notification(
+        message_id=str(uuid.uuid4()), channel="whatsapp", recipient="+919887270348",
+        message="x", status="delivered",
+    )
+    storage.mark_acknowledged(nid, ack_type="reply", ack_message="ok", ack_source="inbound")
+    actions = [a["action"] for a in list_audit(limit=30)]
+    assert "notification_acknowledged" in actions
 
 
 def test_audit_authorization_denied():

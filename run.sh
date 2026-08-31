@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Starts the API on http://127.0.0.1:8000.
+# Starts the API on $HOST:$PORT (default 127.0.0.1:8000).
+#
+# HOST and PORT are read from .env (or the environment). Examples:
+#   HOST=0.0.0.0 PORT=8080 ./run.sh
 #
 # Linux / WSL notes:
 # - Uses venv/bin/uvicorn directly, so the venv does NOT need to be activated.
@@ -22,7 +25,46 @@ if [ ! -x "$BIN" ]; then
   venv/bin/pip install -r requirements.txt
 fi
 
-ARGS=(app.main:app --host 127.0.0.1 --port 8000)
+# Read HOST/PORT from .env (KEY=VALUE lines), falling back to defaults.
+_read_env() {
+  local key="$1" default="$2"
+  local val
+  val=$(grep -E "^${key}=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' "\r' || true)
+  if [ -z "$val" ]; then
+    val="$default"
+  fi
+  printf '%s' "$val"
+}
+
+HOST=$(_read_env HOST "127.0.0.1")
+PORT=$(_read_env PORT "8000")
+
+case "$PORT" in
+  ''|*[!0-9]*)
+    echo "ERROR: PORT must be a number, got: '$PORT'" >&2
+    echo "       Set PORT in .env (or export it) and re-run." >&2
+    exit 1
+    ;;
+esac
+
+# Fail fast with a clear message when the port is already occupied.
+if (exec 3<>"/dev/tcp/$HOST/$PORT") 2>/dev/null; then
+  exec 3>&- 3<&-
+  echo "ERROR: Port $PORT on host $HOST is already in use." >&2
+  echo "" >&2
+  echo "  The notification service is configured to listen on $HOST:$PORT." >&2
+  echo "  Either stop the process using that port, or change the address:" >&2
+  echo "" >&2
+  echo "    # in .env" >&2
+  echo "    HOST=127.0.0.1" >&2
+  echo "    PORT=8080" >&2
+  echo "" >&2
+  echo "    # or as an env override" >&2
+  echo "    HOST=127.0.0.1 PORT=8080 ./run.sh" >&2
+  exit 1
+fi
+
+ARGS=(app.main:app --host "$HOST" --port "$PORT")
 if [ "${USE_RELOAD:-0}" = "1" ]; then
   if grep -qi "microsoft" /proc/version 2>/dev/null; then
     export WATCHFILES_FORCE_POLLING=true
@@ -30,4 +72,5 @@ if [ "${USE_RELOAD:-0}" = "1" ]; then
   ARGS+=(--reload --reload-dir app --reload-delay 3)
 fi
 
+echo "Starting notification service on http://$HOST:$PORT" >&2
 exec "$BIN" "${ARGS[@]}"

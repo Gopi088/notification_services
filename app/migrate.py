@@ -46,10 +46,15 @@ _MIGRATION_PG_ADD_CONTENT_HASH = (
     "ON notifications (content_hash, created_at);"
 )
 
+_MIGRATION_PG_ADD_DELIVERED_AT = (
+    "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;"
+)
+
 # Columns that 0002 adds for existing databases (fresh DBs already have them
 # via SQLITE_SCHEMA / PG_SCHEMA CREATE TABLE).
 _ACK_COLUMNS = {
     "read_at": "TEXT",
+    "delivered_at": "TEXT",
     "acknowledged_at": "TEXT",
     "acknowledgement_type": "TEXT",
     "acknowledgement_message": "TEXT",
@@ -91,6 +96,9 @@ _MIGRATIONS: List[dict] = [
      "sqlite": None},  # handled specially below (column-aware)
     {"id": "0004_add_content_hash_column",
      "pg": _MIGRATION_PG_ADD_CONTENT_HASH,
+     "sqlite": None},  # handled specially below (column-aware)
+    {"id": "0005_add_delivered_at_column",
+     "pg": _MIGRATION_PG_ADD_DELIVERED_AT,
      "sqlite": None},  # handled specially below (column-aware)
 ]
 

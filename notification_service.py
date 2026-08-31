@@ -68,6 +68,51 @@ def _auth_api_key() -> str:
 
 API_KEY = _auth_api_key()
 
+_JWT_TOKEN = ""
+_JWT_CLIENT_ID = ""
+_JWT_CLIENT_SECRET = ""
+
+
+def _auth_client_id() -> str:
+    try:
+        from app.config import get_settings
+        get_settings.cache_clear()
+        return get_settings().AUTH_CLIENT_ID or ""
+    except Exception:
+        return ""
+
+
+def _auth_client_secret() -> str:
+    try:
+        from app.config import get_settings
+        get_settings.cache_clear()
+        return get_settings().auth_client_secret_effective or ""
+    except Exception:
+        return ""
+
+
+def _jwt_login() -> str:
+    """Obtain a JWT from the server and cache it."""
+    global _JWT_TOKEN, _JWT_CLIENT_ID, _JWT_CLIENT_SECRET
+    if not _JWT_CLIENT_ID:
+        _JWT_CLIENT_ID = _auth_client_id()
+        _JWT_CLIENT_SECRET = _auth_client_secret()
+    if not _JWT_CLIENT_ID or not _JWT_CLIENT_SECRET:
+        return ""
+    data = json.dumps({"client_id": _JWT_CLIENT_ID, "client_secret": _JWT_CLIENT_SECRET}).encode()
+    req = urllib.request.Request(
+        BASE_URL + "/api/v1/auth/login", data=data,
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode())
+            _JWT_TOKEN = body.get("access_token", "")
+            return _JWT_TOKEN
+    except Exception:
+        return ""
+
+
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
@@ -81,14 +126,28 @@ def _json_detail(exc):
         return {"detail": str(exc)}
 
 
-def http(method: str, path: str, payload: dict | None = None):
-    data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"} if data else {}
+def _auth_headers(headers: dict) -> dict:
+    """Add the auth header: Bearer JWT (preferred) or legacy X-API-Key."""
+    global _JWT_TOKEN
+    if not _JWT_TOKEN and _SERVER_REQUIRES_AUTH:
+        _JWT_TOKEN = _jwt_login()
+    if _JWT_TOKEN:
+        headers = dict(headers)
+        headers["Authorization"] = f"Bearer {_JWT_TOKEN}"
+        return headers
     key = API_KEY
     if _SERVER_REQUIRES_AUTH and not key:
         key = _ensure_api_key()
     if key:
+        headers = dict(headers)
         headers["X-API-Key"] = key
+    return headers
+
+
+def http(method: str, path: str, payload: dict | None = None):
+    data = json.dumps(payload).encode() if payload is not None else None
+    headers = {"Content-Type": "application/json"} if data else {}
+    headers = _auth_headers(headers)
     req = urllib.request.Request(
         BASE_URL + path,
         data=data,
@@ -99,11 +158,13 @@ def http(method: str, path: str, payload: dict | None = None):
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and not API_KEY and _SERVER_REQUIRES_AUTH:
-            key = _ensure_api_key()
-            headers["X-API-Key"] = key
+        if exc.code == 401 and _SERVER_REQUIRES_AUTH:
+            # Re-login (JWT may have expired) and retry once.
+            global _JWT_TOKEN
+            _JWT_TOKEN = ""
+            headers2 = _auth_headers(headers)
             req2 = urllib.request.Request(
-                BASE_URL + path, data=data, headers=headers, method=method,
+                BASE_URL + path, data=data, headers=headers2, method=method,
             )
             try:
                 with urllib.request.urlopen(req2, timeout=5) as resp:
@@ -117,20 +178,18 @@ def http_full(method: str, path: str, payload: dict | None = None):
     """Like http() but returns (status, headers, body)."""
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Content-Type": "application/json"} if data else {}
-    key = API_KEY
-    if _SERVER_REQUIRES_AUTH and not key:
-        key = _ensure_api_key()
-    if key:
-        headers["X-API-Key"] = key
+    headers = _auth_headers(headers)
     req = urllib.request.Request(BASE_URL + path, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status, dict(resp.headers), json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
-        if exc.code == 401 and not API_KEY and _SERVER_REQUIRES_AUTH:
-            key = _ensure_api_key()
-            headers["X-API-Key"] = key
-            req2 = urllib.request.Request(BASE_URL + path, data=data, headers=headers, method=method)
+        if exc.code == 401 and _SERVER_REQUIRES_AUTH:
+            # Re-login (JWT may have expired) and retry once.
+            global _JWT_TOKEN
+            _JWT_TOKEN = ""
+            headers2 = _auth_headers(headers)
+            req2 = urllib.request.Request(BASE_URL + path, data=data, headers=headers2, method=method)
             try:
                 with urllib.request.urlopen(req2, timeout=5) as resp:
                     return resp.status, dict(resp.headers), json.loads(resp.read().decode())
@@ -343,6 +402,11 @@ def _print_recent_logs(lines: int = 8, delay: float = 3.0,
     print("  -------------------------")
 
 
+def _normalize_channel(ch: str) -> str:
+    """Normalize channel input: trim + case-insensitive ("SMS" -> "sms")."""
+    return ch.strip().lower()
+
+
 def do_send_entries(entries: list, message: str, force: bool = False) -> None:
     """POST pre-built channel entries (each with its own channel/contact/template).
 
@@ -397,7 +461,7 @@ def do_send(channels: list, message: str, template: str = "", template_params: d
             force: bool = False) -> None:
     entries = []
     for ch, ct in channels:
-        entry = {"channel": ch, "contact": ct}
+        entry = {"channel": _normalize_channel(ch), "contact": ct}
         if template:
             entry["template_name"] = template
         if template_params:
@@ -620,7 +684,7 @@ def main() -> None:
                     del filtered[i:i + 2]
                 else:
                     break
-        channels = [c.strip() for c in filtered[0].split(",") if c.strip()]
+        channels = [_normalize_channel(c) for c in filtered[0].split(",") if c.strip()]
         do_send([(c, filtered[1]) for c in channels], filtered[2], template=template, template_params=params, force=force)
     elif cmd in ("send-template", "send_template", "sendwhatsapptemplate") and len(rest) >= 2:
         ensure_server()

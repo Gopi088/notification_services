@@ -27,6 +27,7 @@ from app.storage import (
     PROCESSING,
     QUEUED,
     SUBMITTED,
+    TRANSITIONS,
     get_storage,
 )
 
@@ -44,6 +45,12 @@ def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., Provide
     storage.transition(notification_id, PROCESSING, actor="orchestrator")
     logger.debug("delivery started notification_id=%s channel=%s status=processing",
                  notification_id, channel.value)
+    row = storage.get_notification(notification_id)
+    record_audit(
+        user_id=row.get("created_by") if row else None,
+        action="notification_processing", notification_id=notification_id,
+        channel=channel.value, status="processing",
+    )
     try:
         result = fn()
     except ProviderError as exc:
@@ -389,11 +396,22 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
             "provider": row.get("provider"),
             "provider_message_id": row.get("provider_message_id"),
             "error": row.get("last_error"),
+            "retry_count": row.get("retry_count", 0),
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
             "read_at": row.get("read_at"),
+            "delivered_at": row.get("delivered_at"),
             "acknowledged_at": row.get("acknowledged_at"),
             "acknowledgement_type": row.get("acknowledgement_type"),
+            "delivery_confirmation": _delivery_confirmation(row),
+            "history": [
+                {
+                    "status": e.get("to_status"),
+                    "from_status": e.get("from_status"),
+                    "at": e.get("created_at"),
+                }
+                for e in storage.list_events(row["id"])
+            ],
             **detail,
         })
 
@@ -412,6 +430,90 @@ def get_group_summary(group_id: str) -> Optional[Dict]:
     return {"message_id": group_id, "reference": reference, "status": overall, "channels": channels}
 
 
+# Provider delivery-status -> app lifecycle mapping for on-demand polling.
+# Twilio returns queued/sending/sent/delivered/undelivered/failed/read.
+_PROVIDER_STATUS_MAP = {
+    "queued": None,
+    "sending": None,
+    "accepted": None,
+    "sent": "sent",
+    "delivered": "delivered",
+    "undelivered": "failed",
+    "failed": "failed",
+    "read": "read",
+}
+
+
+def _delivery_confirmation(row: Dict) -> str:
+    """Describe how this provider can confirm delivery (webhook/polling/unavailable).
+
+    This is informational: the service never fakes `delivered` — when a
+    provider cannot confirm, the message stays `submitted`.
+    """
+    provider = row.get("provider") or ""
+    channel = row.get("channel") or ""
+    s = get_settings()
+    if s.MOCK_MODE:
+        return "unavailable"
+    if provider.startswith("twilio"):
+        if channel == "whatsapp":
+            has_webhook = bool(s.WHATSAPP_STATUS_WEBHOOK_URL or s.TWILIO_STATUS_CALLBACK_URL)
+        else:
+            has_webhook = bool(s.SMS_STATUS_WEBHOOK_URL or s.TWILIO_STATUS_CALLBACK_URL)
+        if has_webhook:
+            return "webhook"
+        return "polling" if s.DELIVERY_POLLING_ENABLED else "unavailable"
+    if provider.startswith("azure"):
+        return "webhook"  # Azure Event Grid delivery reports / advanced messages
+    if provider.startswith("vonage"):
+        return "webhook"  # Vonage messages API callbacks
+    return "unavailable"
+
+
+def poll_delivery_status(notification_id: str) -> Optional[Dict]:
+    """Best-effort on-demand delivery check against the provider.
+
+    When a message is still submitted/sent, its provider supports status
+    polling, and DELIVERY_POLLING_ENABLED is true, ask the provider for the
+    current delivery status and persist any valid forward transition (e.g.
+    submitted -> delivered). Never rewinds state and never fails the calling
+    request.
+    """
+    if not get_settings().DELIVERY_POLLING_ENABLED:
+        return None
+    storage = get_storage()
+    row = storage.get_notification(notification_id)
+    if row is None:
+        row = storage.get_notification_by_message_id(notification_id)
+    if not row or not row.get("provider_message_id"):
+        return None
+    if row["status"] not in (SUBMITTED, "sent"):
+        return None  # already terminal or not yet dispatched
+
+    channel = row.get("channel")
+    try:
+        provider = get_provider(Channel(channel))
+        raw_status = provider.poll_status(row["provider_message_id"])
+    except Exception:  # noqa: BLE001 - polling is best-effort
+        return None
+    if not raw_status:
+        return None
+
+    mapped = _PROVIDER_STATUS_MAP.get(raw_status)
+    if not mapped:
+        return None
+    if mapped not in TRANSITIONS.get(row["status"], set()):
+        return row  # provider says a state we cannot reach from here - keep as-is
+
+    logger.info("status poll transition notification_id=%s from=%s to=%s provider=%s",
+                notification_id, row["status"], mapped, provider.name)
+    return storage.transition(
+        row["id"], mapped, actor="status_poll",
+        provider=row.get("provider") or provider.name,
+        provider_message_id=row.get("provider_message_id"),
+    )
+
+
 def get_message_summary(message_id: str) -> Optional[Dict]:
     storage = get_storage()
     row = storage.get_notification_by_message_id(message_id)
@@ -428,10 +530,22 @@ def get_message_summary(message_id: str) -> Optional[Dict]:
         "provider": row.get("provider"),
         "provider_message_id": row.get("provider_message_id"),
         "error": row.get("last_error"),
+        "retry_count": row.get("retry_count", 0),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "read_at": row.get("read_at"),
+        "delivered_at": row.get("delivered_at"),
         "acknowledged_at": row.get("acknowledged_at"),
         "acknowledgement_type": row.get("acknowledgement_type"),
+        "delivery_confirmation": _delivery_confirmation(row),
+        # Full lifecycle timeline (queued -> processing -> submitted -> ...).
+        "history": [
+            {
+                "status": e.get("to_status"),
+                "from_status": e.get("from_status"),
+                "at": e.get("created_at"),
+            }
+            for e in storage.list_events(row["id"])
+        ],
         **detail,
     }

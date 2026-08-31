@@ -38,7 +38,7 @@ def main() -> int:
         run_retry_worker()
         return 0
 
-    channel = args[0]
+    channel = args[0].strip().lower()
     worker_id = None
     if "--worker-id" in args:
         worker_id = args[args.index("--worker-id") + 1]

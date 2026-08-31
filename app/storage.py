@@ -31,6 +31,7 @@ logger = logging.getLogger("storage")
 QUEUED = "queued"
 PROCESSING = "processing"
 SUBMITTED = "submitted"
+SENT = "sent"
 DELIVERED = "delivered"
 FAILED = "failed"
 RETRYING = "retrying"
@@ -43,8 +44,9 @@ EXPIRED = "expired"
 # Legal transitions: current -> {allowed next states}
 TRANSITIONS: Dict[str, set] = {
     QUEUED: {PROCESSING, CANCELLED, EXPIRED},
-    PROCESSING: {SUBMITTED, FAILED, RETRYING, DELIVERED, CANCELLED},
-    SUBMITTED: {DELIVERED, FAILED, READ, EXPIRED},
+    PROCESSING: {SUBMITTED, SENT, FAILED, RETRYING, DELIVERED, CANCELLED},
+    SUBMITTED: {SENT, DELIVERED, FAILED, READ, EXPIRED},
+    SENT: {DELIVERED, READ, FAILED, RETRYING, EXPIRED},
     RETRYING: {PROCESSING, CANCELLED},
     FAILED: {RETRYING, DEAD_LETTERED},
     DEAD_LETTERED: {RETRYING},  # manual requeue
@@ -81,6 +83,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     last_error           TEXT,
     scheduled_at         TEXT,
     read_at              TEXT,
+    delivered_at         TEXT,
     acknowledged_at       TEXT,
     acknowledgement_type TEXT,
     acknowledgement_message TEXT,
@@ -192,6 +195,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     last_error           TEXT,
     scheduled_at         TIMESTAMPTZ,
     read_at              TIMESTAMPTZ,
+    delivered_at         TIMESTAMPTZ,
     acknowledged_at       TIMESTAMPTZ,
     acknowledgement_type TEXT,
     acknowledgement_message TEXT,
@@ -301,6 +305,22 @@ class Storage:
         self._pg_conn = None
 
     # ---- connection management ----
+    def _sqlite_connect(self, *, set_wal: bool = True) -> sqlite3.Connection:
+        """Create a SQLite connection with a generous busy timeout.
+
+        WAL is a persistent file property, so it is set only on the startup
+        connection (set_wal=True) to avoid locking/contention on every
+        short-lived operation connection; busy_timeout + synchronous=NORMAL
+        are applied on every connection.
+        """
+        conn = sqlite3.connect(self._sqlite_path, check_same_thread=False, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
+        if set_wal:
+            conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
     def connect(self) -> None:
         if self.backend == "postgres":
             import psycopg2
@@ -323,8 +343,7 @@ class Storage:
                 "database connected backend=%s host=%s", self.backend, host,
             )
         else:
-            self._conn = sqlite3.connect(self._sqlite_path, check_same_thread=False, timeout=15.0)
-            self._conn.row_factory = sqlite3.Row
+            self._conn = self._sqlite_connect()
             logger.info("storage connected (sqlite: %s)", self._sqlite_path)
 
     def _safe_host(self) -> str:
@@ -357,8 +376,10 @@ class Storage:
 
     @contextmanager
     def _sqlite(self):
-        conn = sqlite3.connect(self._sqlite_path, check_same_thread=False, timeout=15.0)
-        conn.row_factory = sqlite3.Row
+        # Short-lived operation connection: WAL is already the file journal
+        # mode (set once in connect()), so only busy_timeout/synchronous are
+        # (re)applied here to keep per-request connection setup cheap.
+        conn = self._sqlite_connect(set_wal=False)
         try:
             yield conn
             conn.commit()
@@ -619,11 +640,12 @@ class Storage:
                        provider_message_id=COALESCE(%s, provider_message_id),
                        last_error=%s, updated_at=%s,
                        read_at = CASE WHEN %s = 'read' THEN %s ELSE read_at END,
+                       delivered_at = CASE WHEN %s = 'delivered' THEN %s ELSE delivered_at END,
                        acknowledged_at = CASE WHEN %s = 'acknowledged' THEN %s ELSE acknowledged_at END,
                        retry_count = CASE WHEN %s = 'retrying' THEN retry_count + 1 ELSE retry_count END
                        WHERE id=%s""",
                     (to_status, provider, provider_message_id, error, now,
-                     to_status, now, to_status, now, to_status, notification_id),
+                     to_status, now, to_status, now, to_status, now, to_status, notification_id),
                 )
         else:
             with self._sqlite() as conn:
@@ -632,11 +654,12 @@ class Storage:
                        provider_message_id=COALESCE(?, provider_message_id),
                        last_error=?, updated_at=?,
                        read_at = CASE WHEN ? = 'read' THEN ? ELSE read_at END,
+                       delivered_at = CASE WHEN ? = 'delivered' THEN ? ELSE delivered_at END,
                        acknowledged_at = CASE WHEN ? = 'acknowledged' THEN ? ELSE acknowledged_at END,
                        retry_count = CASE WHEN ? = 'retrying' THEN retry_count + 1 ELSE retry_count END
                        WHERE id=?""",
                     (to_status, provider, provider_message_id, error, now,
-                     to_status, now, to_status, now, to_status, notification_id),
+                     to_status, now, to_status, now, to_status, now, to_status, notification_id),
                 )
         self._insert_event(notification_id, current, to_status, actor, {"error": error})
         group_ref = row.get("group_id") if row else None
@@ -644,6 +667,20 @@ class Storage:
             "notification status changed id=%s group_id=%s from=%s to=%s",
             notification_id, group_ref, current, to_status,
         )
+        # Generic status_changed audit so every transition is traceable. The
+        # worker/webhook layers additionally record channel-specific events
+        # (notification_sent, notification_delivered, notification_failed...).
+        try:
+            from app.audit import record_audit
+
+            record_audit(
+                user_id=row.get("created_by"),
+                action="status_changed", notification_id=row.get("message_id") or notification_id,
+                channel=row.get("channel"), status=to_status,
+                metadata={"from_status": current, "actor": actor},
+            )
+        except Exception:  # noqa: BLE001 - never let audit failure break a transition
+            pass
         return self.get_notification(notification_id)
 
     def mark_read(self, notification_id: str, *, actor: str = "webhook") -> Optional[Dict]:
@@ -680,6 +717,18 @@ class Storage:
                        acknowledgement_source=?, updated_at=? WHERE id=?""",
                     (ack_type, ack_message, ack_source, now, notification_id),
                 )
+        try:
+            from app.audit import record_audit
+
+            record_audit(
+                user_id=row.get("created_by"),
+                action="notification_acknowledged",
+                notification_id=row.get("message_id") or notification_id,
+                channel=row.get("channel"), status="acknowledged", result="success",
+                metadata={"ack_type": ack_type, "ack_source": ack_source},
+            )
+        except Exception:  # noqa: BLE001 - audit must never break the flow
+            pass
         return self.get_notification(notification_id)
 
     def set_provider_info(self, notification_id: str, provider: str, provider_message_id: str) -> None:
@@ -749,6 +798,25 @@ class Storage:
                      error_code, error_message, int(retryable) if retryable is not None else None,
                      duration_ms, now),
                 )
+
+    def list_events(self, notification_id: str) -> List[Dict]:
+        """Return the status-transition timeline for a notification (newest last)."""
+        if self.backend == "postgres":
+            with self._pg() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT from_status, to_status, actor, created_at FROM notification_events "
+                    "WHERE notification_id=%s ORDER BY created_at ASC",
+                    (notification_id,),
+                )
+                return [self._row_to_dict(r, cur) for r in cur.fetchall()]
+        else:
+            with self._sqlite() as conn:
+                rows = conn.execute(
+                    "SELECT from_status, to_status, actor, created_at FROM notification_events "
+                    "WHERE notification_id=? ORDER BY created_at ASC",
+                    (notification_id,),
+                ).fetchall()
+                return [dict(r) for r in rows]
 
     def list_attempts(self, notification_id: str) -> List[Dict]:
         if self.backend == "postgres":
@@ -929,6 +997,29 @@ class Storage:
                 )
         return audit_id
 
+    def list_notifications_by_recipient(
+        self, recipient: str, created_by: Optional[str] = None,
+        limit: int = 50, offset: int = 0,
+    ) -> List[Dict]:
+        """Return notifications for a given recipient, ordered by created_at DESC."""
+        clauses = ["recipient = ?"]
+        params: List = [recipient]
+        if created_by:
+            clauses.append("created_by = ?")
+            params.append(created_by)
+        sql = "SELECT * FROM notifications WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        if self.backend == "postgres":
+            q = sql.replace("?", "%s")
+            with self._pg() as conn, conn.cursor() as cur:
+                cur.execute(q, params)
+                return [self._row_to_dict(r, cur) for r in cur.fetchall()]
+        else:
+            with self._sqlite() as conn:
+                rows = conn.execute(sql, params).fetchall()
+                return [dict(r) for r in rows]
+
     def list_audit(self, limit: int = 50, user_id: Optional[str] = None,
                    action: Optional[str] = None) -> List[Dict]:
         """Return recent audit records, optionally filtered by user/action."""
@@ -996,6 +1087,7 @@ class Storage:
                 rows = cur.fetchall()
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, r)) for r in rows]
+
         else:
             with self._sqlite() as conn:
                 rows = conn.execute(

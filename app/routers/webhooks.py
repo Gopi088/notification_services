@@ -1,14 +1,14 @@
 """
-Delivery-receipt webhook.
+Delivery-receipt webhooks.
 
 Azure Communication Services (ACS) Advanced Messaging posts delivery status
 updates (sent/delivered/failed/read) for WhatsApp here. Without this, a send
 that Azure accepts but Meta fails to deliver stays "sent" forever and the real
 failure reason is invisible.
 
-Endpoint URL (configure in Azure portal -> your ACS resource -> Events ->
-Advanced Message Delivery Status Updated -> Webhook):
+Configure Azure Event Grid subscriptions to public HTTPS endpoints:
     https://<public-host>/api/v1/whatsapp/webhook
+    https://<public-host>/api/v1/email/webhook
 """
 import copy
 import logging
@@ -17,12 +17,12 @@ from typing import Any, Dict, Optional, Tuple
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.audit import record_audit
+from app.delivery_status import update_delivery_status
 from app.storage import get_storage
 
 logger = logging.getLogger("webhooks")
 
-router = APIRouter(prefix="/api/v1/whatsapp", tags=["whatsapp-webhook"])
+router = APIRouter(prefix="/api/v1", tags=["delivery-webhook"])
 
 # Keys whose values should be redacted in logs.
 _SECRET_KEYS = frozenset({
@@ -83,16 +83,23 @@ def _extract_failure(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]
     if data.get("statusReason"):
         return None, data.get("statusReason")
 
+    details = data.get("deliveryStatusDetails")
+    if isinstance(details, dict):
+        return details.get("errorCode") or details.get("code"), (
+            details.get("statusMessage") or details.get("message")
+        )
+
     return None, None
 
 
-def _log_event_safe(event: Dict[str, Any]) -> None:
+def _log_event_safe(event: Dict[str, Any], channel: str = "WhatsApp") -> None:
     """Log the complete event JSON with secrets redacted (for debugging)."""
     safe = _redact(copy.deepcopy(event))
-    logger.info("[WhatsApp Delivery Event] %s", safe)
+    logger.info("[%s Delivery Event] %s", channel, safe)
 
 
-@router.get("/webhook", summary="Azure Event Grid validation handshake")
+@router.get("/whatsapp/webhook", summary="Azure Event Grid validation handshake")
+@router.get("/email/webhook", summary="Azure Event Grid validation handshake")
 async def webhook_validate(request: Request):
     code = request.query_params.get("validationCode")
     if code:
@@ -103,7 +110,8 @@ async def webhook_validate(request: Request):
     return JSONResponse({"error": "missing validationCode"}, status_code=400)
 
 
-@router.post("/webhook", summary="Receive WhatsApp delivery status updates and Event Grid validation")
+@router.post("/whatsapp/webhook", summary="Receive Azure WhatsApp delivery events")
+@router.post("/email/webhook", summary="Receive Azure email delivery events")
 async def webhook_receive(request: Request):
     body = await request.json()
     events = body if isinstance(body, list) else [body]
@@ -126,7 +134,34 @@ async def webhook_receive(request: Request):
             logger.warning("SubscriptionValidationEvent missing validationCode")
             continue
 
-        # ---------- Delivery status events ----------
+        # ---------- Email delivery report (Azure Email Communication Service) ----------
+        # eventType: Microsoft.Communication.EmailDeliveryReportReceived
+        # Azure posts this when the email reaches the recipient's mailbox.
+        if event_type == "Microsoft.Communication.EmailDeliveryReportReceived":
+            _log_event_safe(event, channel="Email")
+            data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+            message_id = data.get("messageId") or data.get("message_id") or data.get("id") or ""
+            status = (data.get("status") or "").lower()
+            if not message_id or not status:
+                logger.debug("email delivery report ignored (missing messageId/status)")
+                continue
+            # "Expanded" is an intermediate distribution-list event, not a
+            # result - ignore it (shared service leaves it submitted).
+            if status == "expanded":
+                logger.info("[Email Delivery] message_id=%s status=Expanded (ignored)", message_id)
+                continue
+            error_code, error_message = _extract_failure(data)
+            detail = f"[{error_code}] {error_message}".strip() if error_code else (error_message or "")
+            update_delivery_status(
+                provider="azure_email",
+                provider_message_id=message_id,
+                provider_status=status,
+                error=detail or None,
+                channel="email",
+            )
+            continue
+
+        # ---------- Delivery status events (WhatsApp) ----------
         data = event.get("data") if isinstance(event, dict) and isinstance(event.get("data"), dict) else event
         if data.get("channelType") not in (None, "whatsapp"):
             continue
@@ -141,73 +176,19 @@ async def webhook_receive(request: Request):
         # Log the full event safely for debugging
         _log_event_safe(event)
 
-        status_lower = status.lower()
-        storage = get_storage()
-        if status_lower == "delivered":
-            notif = storage.get_by_provider_message_id(provider_message_id)
-            if notif:
-                storage.transition(notif["id"], "delivered", actor="webhook")
-            storage.record_webhook_event(
-                provider="whatsapp", provider_message_id=provider_message_id,
-                status="delivered", payload=data,
-            )
-            record_audit(
-                user_id=notif.get("created_by") if notif else None,
-                action="notification_delivered", notification_id=notif["id"] if notif else None,
-                channel="whatsapp", status="delivered",
-            )
-            logger.info(
-                "[WhatsApp Delivery Event] message_id=%s status=Delivered channel=whatsapp",
-                provider_message_id,
-            )
-        elif status_lower in ("failed", "undelivered"):
-            error_code, error_message = _extract_failure(data)
-            detail = error_message or error_code or "unknown failure (no error details in event)"
-            if error_code:
-                detail = f"[{error_code}] {error_message}" if error_message else f"[{error_code}]"
-            notif = storage.get_by_provider_message_id(provider_message_id)
-            if notif:
-                storage.transition(
-                    notif["id"], "failed", actor="webhook",
-                    error=f"WhatsApp delivery failed: {detail}",
-                )
-            storage.record_webhook_event(
-                provider="whatsapp", provider_message_id=provider_message_id,
-                status="failed", error_code=error_code, error_message=error_message,
-                payload=data,
-            )
-            record_audit(
-                user_id=notif.get("created_by") if notif else None,
-                action="notification_failed", notification_id=notif["id"] if notif else None,
-                channel="whatsapp", status="failed", result="failure",
-                failure_reason=detail,
-            )
-            logger.warning(
-                "[WhatsApp Delivery Event] message_id=%s status=Failed channel=whatsapp "
-                "error_code=%s error_message=%s",
-                provider_message_id, error_code, error_message,
-            )
-        elif status_lower == "read":
-            notif = storage.get_by_provider_message_id(provider_message_id)
-            if notif:
-                storage.transition(notif["id"], "delivered", actor="webhook")
-            storage.record_webhook_event(
-                provider="whatsapp", provider_message_id=provider_message_id,
-                status="read", payload=data,
-            )
-            logger.info(
-                "[WhatsApp Delivery Event] message_id=%s status=Read channel=whatsapp",
-                provider_message_id,
-            )
-        else:
-            storage.record_webhook_event(
-                provider="whatsapp", provider_message_id=provider_message_id,
-                status=status, payload=data,
-            )
-            logger.info(
-                "[WhatsApp Delivery Event] message_id=%s status=%s channel=whatsapp (unhandled)",
-                provider_message_id, status,
-            )
+        error_code, error_message = _extract_failure(data)
+        detail = error_message or error_code or ""
+        if error_code:
+            detail = f"[{error_code}] {error_message}".strip() if error_message else f"[{error_code}]"
+        # Delegate to the shared delivery-status service (correlation,
+        # idempotency, out-of-order guard, history + audit).
+        update_delivery_status(
+            provider="whatsapp",
+            provider_message_id=provider_message_id,
+            provider_status=status.lower(),
+            error=detail or None,
+            channel="whatsapp",
+        )
 
     logger.debug("webhook response status=ok event_count=%d", len(events))
     return JSONResponse({"status": "ok"})

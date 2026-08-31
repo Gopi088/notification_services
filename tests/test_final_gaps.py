@@ -115,6 +115,11 @@ def test_storage_pg_full_crud(monkeypatch):
     s = Storage(backend="postgres", url="postgresql://postgres:testpass@localhost:5434/notifications")
     s.connect()
     s.init_schema()
+    # Apply migrations so a persistent PG database from an older release gets
+    # columns added later (e.g. delivered_at, content_hash).
+    from app import migrate
+
+    migrate.up()
     mid = str(uuid.uuid4())
     nid = s.create_notification(message_id=mid, channel="sms", recipient="+91", message="x",
                                 status="queued", template_params={"k": "v"})

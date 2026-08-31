@@ -38,10 +38,11 @@ from app.orchestrator import (
 )
 from app.ratelimit import check_api_send, check_recipient
 from app.schemas import (
+    CandidateMessage,
+    CandidateReport,
     ChannelStatus,
     ChannelQueued,
     ErrorResponse,
-    HealthResponse,
     NotificationEventRequest,
     SendRequest,
     SendResponse,
@@ -65,7 +66,7 @@ def _send_error(code: str, message: str, field: Optional[str] = None) -> HTTPExc
     )
 
 
-DUPLICATE_MESSAGE = "This message was already sent recently. Do you want to resend?"
+DUPLICATE_MESSAGE = "Message already sent recently. Resend?"
 
 
 def _duplicate_send_response(
@@ -142,19 +143,6 @@ def _store_idempotency_key(key: str, summary: dict) -> None:
         store_redis(key, notif_id)
 
 
-@router.get(
-    "/health",
-    response_model=HealthResponse,
-    summary="Service health and configuration overview",
-)
-def health() -> HealthResponse:
-    return HealthResponse(
-        service=_settings.APP_NAME,
-        version=__version__,
-        mock_mode=_settings.MOCK_MODE,
-    )
-
-
 @router.post(
     "/notifications/send",
     response_model=SendResponse,
@@ -177,16 +165,17 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
     logger.debug("send request parsed request_id=%s user_id=%s channel_count=%d",
                  request_id, user_id, len(payload.channels))
 
-    key_id = request.headers.get("X-API-Key", "anon")[:16]
+    key_id = user_id  # rate-limit bucket keyed on the authenticated identity
 
     # ---- Rate limiting ----
     rl = check_api_send(key_id)
     logger.debug("send rate limit checked request_id=%s user_id=%s allowed=%s remaining=%d",
                  request_id, user_id, rl.allowed, rl.remaining)
     if not rl.allowed:
-        logger.warning("rate limited send key=%s request_id=%s", key_id, request_id)
+        # Log the hashed user identity, never the raw API key.
+        logger.warning("rate limited send user_id=%s request_id=%s", user_id, request_id)
         record_audit(
-            user_id=key_id, action="rate_limit_exceeded", result="failure",
+            user_id=user_id, action="rate_limit_exceeded", result="failure",
             failure_reason="send limit exceeded", request_id=request_id,
         )
         raise HTTPException(
@@ -459,7 +448,7 @@ def send_event(payload: NotificationEventRequest, background_tasks: BackgroundTa
         except ContactValidationError as exc:
             raise _send_error("validation_error", str(exc), field="deliveries") from exc
 
-    key_id = request.headers.get("X-API-Key", "anon")[:16]
+    key_id = user_id  # rate-limit bucket keyed on the authenticated identity
     rl = check_api_send(key_id)
     if not rl.allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(rl.reset_seconds)},
@@ -492,6 +481,16 @@ def status(notification_id: str, request: Request) -> StatusResponse:
                 notification_id, request_id, user_id)
     logger.debug("status lookup started request_id=%s notification_id=%s user_id=%s",
                  request_id, notification_id, user_id)
+
+    # On-demand delivery poll: when the message is submitted/sent and the
+    # provider supports it, query the real delivery state so the status shows
+    # delivered/failed even without a webhook. Best-effort (never fails).
+    try:
+        from app.orchestrator import poll_delivery_status
+
+        poll_delivery_status(notification_id)
+    except Exception:  # noqa: BLE001 - polling must never break a status read
+        pass
 
     # Prefer the group view; fall back to a single message id.
     group = get_group_summary(notification_id)
@@ -533,14 +532,18 @@ def status(notification_id: str, request: Request) -> StatusResponse:
                     provider=single.get("provider"),
                     provider_message_id=single.get("provider_message_id"),
                     error=single.get("error"),
+                    retry_count=single.get("retry_count", 0),
                     created_at=single["created_at"],
                     updated_at=single["updated_at"],
                     elapsed_seconds=single.get("elapsed_seconds"),
                     timed_out=single.get("timed_out", False),
                     delivery_timeout_seconds=single.get("delivery_timeout_seconds"),
+                    delivered_at=single.get("delivered_at"),
                     read_at=single.get("read_at"),
                     acknowledged_at=single.get("acknowledged_at"),
                     acknowledgement_type=single.get("acknowledgement_type"),
+                    delivery_confirmation=single.get("delivery_confirmation", "unavailable"),
+                    history=single.get("history", []),
                 )
             ],
         )
@@ -557,4 +560,78 @@ def status(notification_id: str, request: Request) -> StatusResponse:
         detail=ErrorResponse(
             error={"code": "not_found", "message": f"No notification found with id '{notification_id}'"}
         ).model_dump(),
+    )
+
+
+@router.get(
+    "/reports/candidates/{candidate_id}",
+    response_model=CandidateReport,
+    summary="Candidate communication report",
+    description=(
+        "Returns a delivery report for a candidate/contact: message counts by "
+        "channel and status, plus the detailed notification records. When auth "
+        "is enabled, only the authenticated user's own messages are included."
+    ),
+    responses={404: {"model": ErrorResponse}},
+)
+def candidate_report(candidate_id: str, request: Request,
+                     limit: int = 50, offset: int = 0) -> CandidateReport:
+    request_id = _get_request_id(request)
+    user_id = user_id_from_request(request)
+    logger.info("candidate report requested candidate_id=%s request_id=%s user_id=%s",
+                candidate_id, request_id, user_id)
+    record_audit(
+        user_id=user_id, action="candidate_report_queried",
+        request_id=request_id, metadata={"candidate_id": candidate_id},
+    )
+
+    storage = get_storage()
+    # Authorization scope: when authenticated, only the caller's own messages.
+    scope = None if user_id == "anonymous" else user_id
+    rows = storage.list_notifications_by_recipient(
+        recipient=candidate_id, created_by=scope, limit=100000, offset=0,
+    )
+    if not rows:
+        logger.info("candidate report empty candidate_id=%s request_id=%s", candidate_id, request_id)
+        return CandidateReport(candidate_id=candidate_id, total_messages=0,
+                               by_channel={}, by_status={}, messages=[])
+
+    total = len(rows)
+    by_channel: dict = {}
+    by_status: dict = {}
+    for row in rows:
+        by_channel[row["channel"]] = by_channel.get(row["channel"], 0) + 1
+        by_status[row["status"]] = by_status.get(row["status"], 0) + 1
+
+    safe_limit = min(max(limit, 1), 100)
+    safe_offset = max(offset, 0)
+    page = rows[safe_offset:safe_offset + safe_limit]
+    messages = [
+        CandidateMessage(
+            message_id=row["message_id"],
+            channel=row["channel"],
+            contact=row["recipient"],
+            status=row["status"],
+            provider=row.get("provider"),
+            provider_message_id=row.get("provider_message_id"),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            delivered_at=row.get("delivered_at"),
+            read_at=row.get("read_at"),
+            retry_count=row.get("retry_count", 0),
+            error=row.get("last_error"),
+            group_id=row.get("group_id"),
+            reference=row.get("reference"),
+            resend_count=row.get("resend_count", 0),
+        )
+        for row in page
+    ]
+    logger.info("candidate report completed candidate_id=%s total=%d request_id=%s",
+                candidate_id, total, request_id)
+    return CandidateReport(
+        candidate_id=candidate_id,
+        total_messages=total,
+        by_channel=by_channel,
+        by_status=by_status,
+        messages=messages,
     )

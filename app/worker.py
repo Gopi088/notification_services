@@ -81,6 +81,21 @@ def process_message(channel: str, payload: Dict) -> bool:
     if updated is None:
         return True
     logger.debug("worker processing notification_id=%s channel=%s status=processing", notification_id, channel)
+    record_audit(
+        user_id=notification.get("created_by"),
+        action="notification_processing", notification_id=notification_id,
+        channel=channel, status="processing",
+    )
+
+    # Record retry_attempted when this is a retry (attempt > 1), so retry
+    # history is visible end to end.
+    if attempt > 1:
+        record_audit(
+            user_id=notification.get("created_by"),
+            action="retry_attempted", notification_id=notification_id,
+            channel=channel, status="processing",
+            metadata={"attempt": attempt},
+        )
 
     provider = None
     started = time.monotonic()
@@ -181,9 +196,10 @@ def process_message(channel: str, payload: Dict) -> bool:
                          notification_id, channel, attempt + 1)
             record_audit(
                 user_id=notification.get("created_by"),
-                action="notification_retrying", notification_id=notification_id,
+                action="retry_scheduled", notification_id=notification_id,
                 channel=channel, status=RETRYING, result="failure",
                 failure_reason=error_msg,
+                metadata={"attempt": attempt, "next_attempt": attempt + 1, "delay_ms": delay},
             )
         else:
             storage.transition(
@@ -201,9 +217,10 @@ def process_message(channel: str, payload: Dict) -> bool:
             )
             record_audit(
                 user_id=notification.get("created_by"),
-                action="notification_dead_lettered", notification_id=notification_id,
+                action="notification_failed", notification_id=notification_id,
                 channel=channel, status=DEAD_LETTERED if retryable else FAILED,
                 result="failure", failure_reason=error_msg,
+                metadata={"dead_lettered": True},
             )
         return True
 

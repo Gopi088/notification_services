@@ -9,13 +9,11 @@ from app.providers.vonage_provider import VonageSMSProvider
 
 @pytest.fixture(autouse=True)
 def vonage_env(monkeypatch):
-    import os
-
-    os.environ["MOCK_MODE"] = "false"
-    os.environ["VONAGE_API_KEY"] = "test-key"
-    os.environ["VONAGE_API_SECRET"] = "test-secret"
-    os.environ["VONAGE_SMS_FROM"] = "Vonage APIs"
-    os.environ["AZURE_DEFAULT_COUNTRY_CODE"] = "91"
+    monkeypatch.setenv("MOCK_MODE", "false")
+    monkeypatch.setenv("VONAGE_API_KEY", "test-key")
+    monkeypatch.setenv("VONAGE_API_SECRET", "test-secret")
+    monkeypatch.setenv("VONAGE_SMS_FROM", "Vonage APIs")
+    monkeypatch.setenv("AZURE_DEFAULT_COUNTRY_CODE", "91")
     from app.config import get_settings
 
     get_settings.cache_clear()

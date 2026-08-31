@@ -2,6 +2,13 @@
 import json
 import logging
 
+# Importing app.main runs configure_logging() ONCE at collection. This makes
+# caplog-based tests independent of import order: if app.main were imported
+# inside a test instead, configure_logging() would wipe caplog's root handler
+# (root.handlers = []), so caplog would capture nothing when this module runs
+# in isolation.
+from app.main import request_validation_error_handler  # noqa: F401
+
 
 def test_mask_phone():
     from app.logging_config import mask
@@ -111,6 +118,46 @@ def test_configure_logging_routes_uvicorn_through_root(monkeypatch):
     get_settings.cache_clear()
 
 
+def test_configure_logging_suppresses_http_libraries_at_info(monkeypatch):
+    """At INFO, Azure SDK / urllib3 / httpx loggers are suppressed to WARNING
+    so HTTP diagnostics do not flood normal logs."""
+    import os
+
+    os.environ["LOG_LEVEL"] = "INFO"
+    from app.config import get_settings
+    from app.logging_config import configure_logging
+
+    get_settings.cache_clear()
+    configure_logging()
+    for name in ("azure", "azure.core.pipeline", "urllib3", "httpx", "httpcore"):
+        assert logging.getLogger(name).level == logging.WARNING, name
+    # The app's own loggers stay at NOTSET (inherit from root), so INFO flow
+    # messages still appear.
+    assert logging.getLogger("app").level == logging.NOTSET
+    get_settings.cache_clear()
+    logging.getLogger().handlers = []
+    for name in ("azure", "azure.core.pipeline", "urllib3", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+
+def test_configure_logging_keeps_sdk_verbose_at_debug(monkeypatch):
+    """At DEBUG, SDK loggers stay verbose for troubleshooting."""
+    import os
+
+    os.environ["LOG_LEVEL"] = "DEBUG"
+    from app.config import get_settings
+    from app.logging_config import configure_logging
+
+    get_settings.cache_clear()
+    configure_logging()
+    for name in ("azure", "azure.core.pipeline", "urllib3", "httpx", "httpcore"):
+        assert logging.getLogger(name).level == logging.DEBUG, name
+    get_settings.cache_clear()
+    logging.getLogger().handlers = []
+    for name in ("azure", "azure.core.pipeline", "urllib3", "httpx", "httpcore"):
+        logging.getLogger(name).setLevel(logging.NOTSET)
+
+
 def test_configure_logging_rotating_file(monkeypatch, tmp_path):
     import os
 
@@ -170,6 +217,29 @@ def test_debug_flow_logs_are_safe_and_correlated(caplog):
     assert "channel=sms" in caplog.text
 
 
+def test_debug_lifecycle_logs_cover_request_flow(client, caplog):
+    """LOG_LEVEL=DEBUG surfaces the full request lifecycle trace."""
+    from unittest.mock import patch
+
+    from app.providers.base import ProviderResult
+
+    caplog.set_level(logging.DEBUG)
+    with patch("app.providers.vonage_provider.VonageSMSProvider.send") as fake:
+        fake.return_value = ProviderResult("vonage_sms", "m-life", "submitted")
+        r = client.post("/api/v1/notifications/send",
+                        json={"channels": [{"channel": "sms", "contact": "+919887270348"}],
+                              "message": "lifecycle debug"})
+    assert r.status_code == 202
+    text = caplog.text
+    # Lifecycle markers: request -> validation -> idempotency -> DB -> status.
+    for marker in ("send request parsed", "send idempotency resolved",
+                   "send validation passed", "notification created",
+                   "API request completed"):
+        assert marker in text, f"missing DEBUG lifecycle marker: {marker}"
+    # Message content is never logged.
+    assert "lifecycle debug" not in text
+
+
 def test_validation_error_logging_does_not_include_submitted_value(caplog):
     """The validation handler logs method/path/count but never the submitted input.
 
@@ -181,7 +251,6 @@ def test_validation_error_logging_does_not_include_submitted_value(caplog):
 
     from fastapi import Request
     from fastapi.exceptions import RequestValidationError
-    from app.main import request_validation_error_handler
 
     request = Request({"type": "http", "method": "POST", "path": "/send", "headers": []})
     error = RequestValidationError([{
@@ -506,4 +575,89 @@ def test_file_handler_never_colored(monkeypatch, tmp_path):
         except Exception:
             pass
     logging.getLogger().handlers = []
+    get_settings.cache_clear()
+
+
+def test_default_log_level_is_info(monkeypatch):
+    """Production default LOG_LEVEL is INFO (DEBUG must be opted in)."""
+    from app.config import Settings
+
+    # The code default (independent of any .env / environment override) is INFO.
+    assert Settings.model_fields["LOG_LEVEL"].default == "INFO"
+
+    # LOG_LEVEL is fully configurable through the environment.
+    monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    assert get_settings().LOG_LEVEL == "DEBUG"
+    get_settings.cache_clear()
+
+
+def test_sensitive_fields_redacted_in_plain_formatter():
+    """Secrets (database_url, authorization, api keys, passwords) never appear."""
+    import io
+    import logging
+
+    from app.logging_config import PlainFormatter
+
+    fmt = PlainFormatter("%(message)s", use_colors=False)
+    record = logging.LogRecord("app", logging.INFO, __file__, 1,
+                               "send request parsed", None, None)
+    record.__dict__["extra"] = {
+        "database_url": "postgresql://user:pass@host:5432/db",
+        "authorization": "Bearer super-secret-token",
+        "api_key": "AKIA-secret-key-value",
+        "password": "hunter2",
+        "connection_string": "endpoint=azure;key=verysecret",
+    }
+    out = fmt.format(record)
+    assert "postgresql://user:pass" not in out
+    assert "super-secret-token" not in out
+    assert "AKIA-secret-key-value" not in out
+    assert "hunter2" not in out
+    assert "verysecret" not in out
+    assert out.count("***") >= 5
+
+
+def test_sensitive_fields_redacted_in_json_formatter():
+    """Structured (JSON) logs mask secret field names too."""
+    import logging
+
+    from app.logging_config import StructuredFormatter
+
+    fmt = StructuredFormatter()
+    record = logging.LogRecord("app", logging.INFO, __file__, 1, "event", None, None)
+    record.__dict__["extra"] = {
+        "database_url": "postgresql://user:pass@host:5432/db",
+        "authorization": "Bearer super-secret-token",
+        "api_key": "AKIA-secret-key-value",
+    }
+    out = fmt.format(record)
+    for secret in ("user:pass", "super-secret-token", "AKIA-secret-key-value"):
+        assert secret not in out
+    assert out.count("***") >= 3
+
+
+def test_audit_recorded_regardless_of_log_level(monkeypatch, tmp_path):
+    """Audit events are persisted even when LOG_LEVEL=INFO (separate from app logs)."""
+    import os
+
+    from app.audit import list_audit, record_audit
+    from app.config import get_settings
+    from app.storage import get_storage
+
+    monkeypatch.setenv("LOG_LEVEL", "INFO")
+    get_settings.cache_clear()
+
+    storage = get_storage()
+    record_audit(
+        user_id="usr_audit_info", action="notification_created",
+        notification_id="audit-level-1", channel="sms",
+        status="queued", request_id="req_audit_info",
+    )
+    rows = list_audit(limit=10)
+    matching = [r for r in rows if r["notification_id"] == "audit-level-1"]
+    assert matching, "audit event must be recorded even at LOG_LEVEL=INFO"
+    assert matching[0]["action"] == "notification_created"
     get_settings.cache_clear()

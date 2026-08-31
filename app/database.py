@@ -45,8 +45,13 @@ _MIGRATIONS = [
 
 @contextmanager
 def get_connection():
-    conn = sqlite3.connect(_settings.DATABASE_PATH)
+    """Create a SQLite connection with the same concurrency-safe configuration
+    as app/storage.py (WAL, busy_timeout, NORMAL sync)."""
+    conn = sqlite3.connect(_settings.DATABASE_PATH, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     try:
         yield conn
         conn.commit()

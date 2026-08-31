@@ -14,7 +14,18 @@ x-app-base: &app-base
     - QUEUE_ENABLED=${QUEUE_ENABLED:-true}
     - LOG_FILE=logs/app.log
     - AUDIT_LOG_FILE=logs/audit.log
-    - LOG_LEVEL=INFO
+    # Operational settings come from the environment (AWS task env / .env /
+    # compose override) - change them without rebuilding the image.
+    - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    - LOG_FORMAT=${LOG_FORMAT:-text}
+    - DUPLICATE_WINDOW_MINUTES=${DUPLICATE_WINDOW_MINUTES:-30}
+    - IDEMPOTENCY_TTL_SECONDS=${IDEMPOTENCY_TTL_SECONDS:-86400}
+    - AUTH_ENABLED=${AUTH_ENABLED:-false}
+    - JWT_SECRET_KEY=${JWT_SECRET_KEY:-}
+    - JWT_ALGORITHM=${JWT_ALGORITHM:-HS256}
+    - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=${JWT_ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+    - AUTH_CLIENT_ID=${AUTH_CLIENT_ID:-notification-service}
+    - AUTH_CLIENT_SECRET=${AUTH_CLIENT_SECRET:-}
   volumes:
     - ./logs:/app/logs
   depends_on:

@@ -424,3 +424,82 @@ def test_whatsapp_send_delivery_template():
         )
     assert captured["data"]["ContentSid"] == "HXfe5ab5f00277942d4d4200328b4d403c"
     assert json.loads(captured["data"]["ContentVariables"]) == {"1": "Rahul"}
+
+
+def test_poll_status_returns_provider_status():
+    captured = {}
+
+    def fake_get(url, auth=None, timeout=None, **kw):
+        captured["url"] = url
+        captured["auth"] = auth
+        captured["timeout"] = timeout
+        resp = requests.Response()
+        resp.status_code = 200
+        resp._content = json.dumps({"status": "delivered"}).encode()
+        return resp
+
+    provider = TwilioSMSProvider()
+    with patch("app.providers.twilio_provider.requests.get", side_effect=fake_get):
+        status = provider.poll_status("SM1234567890abcdef")
+
+    assert "ACtest0000000000000000000000000001" in captured["url"]
+    assert "SM1234567890abcdef" in captured["url"]
+    assert status == "delivered"
+    assert captured["auth"] == ("ACtest0000000000000000000000000001", "tok-secret")
+
+
+def test_sms_send_attaches_status_callback(monkeypatch):
+    """SMS sends include TWILIO_SMS_STATUS_CALLBACK_URL as the StatusCallback."""
+    from app.config import get_settings
+
+    monkeypatch.setenv("TWILIO_SMS_STATUS_CALLBACK_URL", "https://x/api/v1/twilio/status")
+    monkeypatch.setenv("TWILIO_STATUS_CALLBACK_URL", "")
+    get_settings.cache_clear()
+    captured = {}
+
+    def fake_post(url, data=None, **kw):
+        captured["data"] = data
+        return _fake_response(201, _OK)
+
+    provider = TwilioSMSProvider()
+    with patch("app.providers.twilio_provider.requests.post", side_effect=fake_post):
+        provider.send("9887270348", "hi")
+    assert captured["data"]["StatusCallback"] == "https://x/api/v1/twilio/status"
+    get_settings.cache_clear()
+
+
+def test_whatsapp_send_attaches_status_callback(monkeypatch):
+    """WhatsApp sends include TWILIO_WHATSAPP_STATUS_CALLBACK_URL as the StatusCallback."""
+    from app.config import get_settings
+
+    monkeypatch.setenv("TWILIO_WHATSAPP_STATUS_CALLBACK_URL", "https://x/api/v1/twilio/status")
+    monkeypatch.setenv("TWILIO_STATUS_CALLBACK_URL", "")
+    get_settings.cache_clear()
+    captured = {}
+
+    def fake_post(url, data=None, **kw):
+        captured["data"] = data
+        return _fake_response(201, _OK)
+
+    provider = TwilioWhatsAppProvider()
+    with patch("app.providers.twilio_provider.requests.post", side_effect=fake_post):
+        provider.send("9887270348", "hi")
+    assert captured["data"]["StatusCallback"] == "https://x/api/v1/twilio/status"
+    get_settings.cache_clear()
+
+
+def test_poll_status_mock_mode_returns_none(monkeypatch):
+    monkeypatch.setenv("MOCK_MODE", "true")
+    from app.config import get_settings
+
+    get_settings.cache_clear()
+    provider = TwilioSMSProvider()
+    assert provider.poll_status("SM123") is None
+    get_settings.cache_clear()
+
+
+def test_poll_status_error_returns_none():
+    provider = TwilioSMSProvider()
+    with patch("app.providers.twilio_provider.requests.get",
+               side_effect=requests.ConnectionError("down")):
+        assert provider.poll_status("SM123") is None

@@ -201,6 +201,41 @@ def test_submitted_to_expired(storage):
     assert row["status"] == "expired"
 
 
+def test_delivered_at_set_on_delivery(storage):
+    """Transitioning to delivered stamps delivered_at; nothing before."""
+    import uuid
+
+    nid = storage.create_notification(
+        message_id=str(uuid.uuid4()), channel="sms", recipient="+919887270348",
+        message="hi", status="submitted",
+    )
+    row = storage.transition(nid, "delivered", actor="webhook")
+    assert row["status"] == "delivered"
+    assert row["delivered_at"] is not None
+    # Backward transition delivered -> submitted is rejected and state kept.
+    row2 = storage.transition(nid, "submitted", actor="webhook")
+    assert row2["status"] == "delivered"
+
+
+def test_status_changed_audit_recorded(storage):
+    """Every transition records a status_changed audit event."""
+    import uuid
+
+    from app.audit import list_audit
+
+    mid = str(uuid.uuid4())
+    nid = storage.create_notification(
+        message_id=mid, channel="sms", recipient="+919887270348",
+        message="hi", status="queued",
+    )
+    storage.transition(nid, "processing", actor="worker")
+    storage.transition(nid, "submitted", actor="worker", provider="p", provider_message_id="pm")
+    rows = [a for a in list_audit(limit=50) if a["action"] == "status_changed"]
+    assert rows, "expected status_changed audit events"
+    assert rows[0]["notification_id"]
+    assert rows[0]["channel"] == "sms"
+
+
 def test_queued_to_expired(storage):
     nid = storage.create_notification(
         message_id="exp-2", channel="whatsapp", recipient="+919887270348",
@@ -246,3 +281,74 @@ def test_find_recent_by_content_hash_respects_window(storage):
     assert storage.find_recent_by_content_hash(chash, window_minutes=30) is None
     # A wider window sees it.
     assert storage.find_recent_by_content_hash(chash, window_minutes=300) is not None
+
+
+def test_sqlite_wal_and_busy_timeout(storage):
+    """SQLite connections use WAL journal, NORMAL sync, and 30s busy_timeout."""
+    s = storage
+    assert s.backend == "sqlite"
+    conn = s._sqlite_connect()
+    try:
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        busy = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        sync = conn.execute("PRAGMA synchronous").fetchone()[0]
+    finally:
+        conn.close()
+    assert journal == "wal", f"expected wal, got {journal}"
+    assert busy == 30000, f"expected 30000, got {busy}"
+    assert sync == 1, f"expected NORMAL(1), got {sync}"
+
+
+def test_sqlite_connect_uses_same_config(storage):
+    """Storage.connect() applies the same PRAGMA settings."""
+    s = storage
+    conn = s._conn
+    if conn is None:
+        s.connect()
+        conn = s._conn
+    assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30000
+    assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1  # NORMAL
+
+
+def test_sqlite_concurrent_writes_no_lock_errors(storage):
+    """Concurrent writers do not raise 'database is locked' with WAL + busy_timeout."""
+    import concurrent.futures
+    import uuid
+
+    s = storage
+
+    def _write(i):
+        try:
+            with s._sqlite() as conn:
+                conn.execute(
+                    "INSERT INTO notification_events "
+                    "(notification_id, from_status, to_status, actor, created_at) "
+                    "VALUES (?,?,?,?,?)",
+                    (str(uuid.uuid4()), "a", "b", f"w{i}", "2026-01-01T00:00:00+00:00"),
+                )
+            return "ok"
+        except Exception as exc:  # noqa: BLE001
+            return f"{type(exc).__name__}: {exc}"
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as ex:
+        results = list(ex.map(_write, range(200)))
+
+    assert all(r == "ok" for r in results), f"lock errors: {[r for r in results if r != 'ok'][:5]}"
+
+
+def test_sqlite_concurrent_notification_sends(client):
+    """Concurrent API sends complete without database-lock errors."""
+    import concurrent.futures
+
+    # No provider patch: conftest runs with MOCK_MODE=true, so providers
+    # short-circuit and never contact Twilio/Azure/Vonage.
+    def _send(i):
+        r = client.post("/api/v1/notifications/send",
+                        json={"channels": [{"channel": "sms", "contact": f"+919600000{i:05d}"}],
+                              "message": f"c{i}"})
+        return r.status_code
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        codes = list(ex.map(_send, range(60)))
+    assert all(c == 202 for c in codes), f"non-202: {[c for c in codes if c != 202][:5]}"

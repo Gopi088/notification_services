@@ -80,6 +80,54 @@ class _TwilioMixin:
                 "API keys & tokens)."
             )
 
+    def _with_status_callback(self, s, data: Dict[str, str], channel: str = "sms") -> Dict[str, str]:
+        """Attach the delivery-status callback URL when configured so the app
+        can transition submitted -> delivered/failed via Twilio webhooks.
+
+        Resolution order (most specific first):
+          SMS:      TWILIO_SMS_STATUS_CALLBACK_URL
+                    -> SMS_STATUS_WEBHOOK_URL -> TWILIO_STATUS_CALLBACK_URL
+          WhatsApp: TWILIO_WHATSAPP_STATUS_CALLBACK_URL
+                    -> WHATSAPP_STATUS_WEBHOOK_URL -> TWILIO_STATUS_CALLBACK_URL
+        """
+        if channel == "whatsapp":
+            callback = (
+                s.TWILIO_WHATSAPP_STATUS_CALLBACK_URL
+                or s.WHATSAPP_STATUS_WEBHOOK_URL
+                or s.TWILIO_STATUS_CALLBACK_URL
+            )
+        else:
+            callback = (
+                s.TWILIO_SMS_STATUS_CALLBACK_URL
+                or s.SMS_STATUS_WEBHOOK_URL
+                or s.TWILIO_STATUS_CALLBACK_URL
+            )
+        if callback:
+            data = dict(data)
+            data["StatusCallback"] = callback
+        return data
+
+    def poll_status(self, provider_message_id: str) -> Optional[str]:
+        """Query Twilio for the current message status (queued/sent/delivered/
+        failed/undelivered/read). Used for on-demand delivery checks when the
+        StatusCallback webhook is not configured."""
+        s = get_settings()
+        if s.MOCK_MODE:
+            return None
+        try:
+            url = (
+                f"https://api.twilio.com/2010-04-01/Accounts/"
+                f"{s.TWILIO_ACCOUNT_SID}/Messages/{provider_message_id}.json"
+            )
+            resp = requests.get(
+                url, auth=(s.TWILIO_ACCOUNT_SID, s.TWILIO_AUTH_TOKEN), timeout=15
+            )
+            if resp.status_code == 200:
+                return (resp.json().get("status") or "").lower()
+        except Exception:  # noqa: BLE001 - polling must never crash a status read
+            logger.warning("[Twilio] status poll failed message_id=%s", provider_message_id)
+        return None
+
     def _post(self, s, data: Dict[str, str]) -> Dict:
         url = self._messages_url(s.TWILIO_ACCOUNT_SID)
         try:
@@ -163,7 +211,7 @@ class TwilioSMSProvider(_TwilioMixin, NotificationProvider):
         to = _normalize_phone(contact, s.AZURE_DEFAULT_COUNTRY_CODE)
         logger.info("[SMS] Provider: Twilio | From: %s | To: %s", s.TWILIO_FROM, to)
 
-        data = {"To": to, "From": s.TWILIO_FROM, "Body": message}
+        data = self._with_status_callback(s, {"To": to, "From": s.TWILIO_FROM, "Body": message}, channel="sms")
         try:
             result = self._post(s, data)
         except ProviderError as exc:
@@ -175,7 +223,8 @@ class TwilioSMSProvider(_TwilioMixin, NotificationProvider):
                     "[SMS] Twilio trial account: free-form SMS rejected, falling back to "
                     "predefined template '%s'", s.TWILIO_SMS_TEMPLATE,
                 )
-                data = {"To": to, "From": s.TWILIO_FROM, "Body": s.TWILIO_SMS_TEMPLATE}
+                data = self._with_status_callback(s, {"To": to, "From": s.TWILIO_FROM, "Body": s.TWILIO_SMS_TEMPLATE},
+                                                  channel="sms")
                 result = self._post(s, data)
             else:
                 raise
@@ -233,11 +282,11 @@ class TwilioWhatsAppProvider(_TwilioMixin, NotificationProvider):
         logger.info("[WhatsApp] Provider: Twilio | From: %s | To: %s", sender, to)
         logger.info("[WhatsApp] Message type: TEXT (24h session window)")
 
-        data = {
+        data = self._with_status_callback(s, {
             "To": f"whatsapp:{to}",
             "From": f"whatsapp:{sender}",
             "Body": message,
-        }
+        }, channel="whatsapp")
         try:
             result = self._post(s, data)
         except ProviderError as exc:
@@ -303,11 +352,11 @@ class TwilioWhatsAppProvider(_TwilioMixin, NotificationProvider):
         logger.info("[WhatsApp] Message type: TEMPLATE")
         logger.info("[WhatsApp] ContentSid: %s", content_sid)
 
-        data = {
+        data = self._with_status_callback(s, {
             "To": f"whatsapp:{to}",
             "From": f"whatsapp:{sender}",
             "ContentSid": content_sid,
-        }
+        }, channel="whatsapp")
         variables = _content_variables(template_params)
         if variables:
             data["ContentVariables"] = variables

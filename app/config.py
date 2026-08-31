@@ -15,6 +15,11 @@ class Settings(BaseSettings):
 
     # --- General ---
     APP_NAME: str = "Notification Service"
+    # Server bind address/port (used by run.sh and Docker). HOST/PORT are read
+    # from the environment so the service can be launched on any address
+    # without rebuilding. Defaults: 127.0.0.1:8000.
+    HOST: str = "127.0.0.1"
+    PORT: int = 8000
     # When MOCK_MODE=true, no real provider APIs are called. Messages are
     # "sent" locally and marked delivered/failed pseudo-randomly. This lets
     # you exercise the full API from the CLI without any real credentials.
@@ -25,6 +30,19 @@ class Settings(BaseSettings):
     # Set AUTH_ENABLED=true to require an API key on notification API routes.
     AUTH_ENABLED: bool = False
     AUTH_API_KEY: str = ""
+
+    # --- JWT authentication (replaces X-API-Key for /api/v1/*) ---
+    # Signing secret used to issue/verify access tokens. Generate one, e.g.:
+    #   python -c "import secrets; print(secrets.token_hex(32))"
+    # NEVER hardcode or commit a real secret.
+    JWT_SECRET_KEY: str = ""
+    JWT_ALGORITHM: str = "HS256"
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    # Login credentials: the client authenticates with client_id + client_secret
+    # at /api/v1/auth/login and receives a JWT. Defaults to AUTH_CLIENT_SECRET
+    # falling back to AUTH_API_KEY when unset.
+    AUTH_CLIENT_ID: str = "notification-service"
+    AUTH_CLIENT_SECRET: str = ""
 
     # --- Delivery SLA ---
     # How long (in seconds) a message may sit in "queued"/"sent" before the
@@ -167,6 +185,37 @@ class Settings(BaseSettings):
     #   test_template=HXfe5ab5f00277942d4d4200328b4d403c;reminder=HX...
     # (JSON object form is also accepted: {"test_template": "HX..."}).
     TWILIO_WHATSAPP_TEMPLATES: str = ""
+    # Public URL where Twilio posts delivery-status callbacks for SMS and
+    # WhatsApp messages. When set, the provider includes `StatusCallback` so
+    # the app can transition submitted -> delivered/failed automatically.
+    # Example: https://your-host/api/v1/twilio/status
+    TWILIO_STATUS_CALLBACK_URL: str = ""
+
+    # --- Delivery-status webhook URLs (per channel) ---
+    # Public URLs where the providers post delivery callbacks. These override
+    # TWILIO_STATUS_CALLBACK_URL for the respective channel. Point them at
+    # your public host (e.g. an ngrok URL) during local development.
+    #   https://<ngrok-domain>/api/v1/sms/webhook
+    #   https://<ngrok-domain>/api/v1/whatsapp/webhook
+    SMS_STATUS_WEBHOOK_URL: str = ""
+    WHATSAPP_STATUS_WEBHOOK_URL: str = ""
+
+    # --- Twilio dedicated status-callback URLs (preferred) ---
+    # Twilio posts outbound delivery status here (form-encoded). These take
+    # precedence over SMS_STATUS_WEBHOOK_URL / WHATSAPP_STATUS_WEBHOOK_URL.
+    #   https://<host>/api/v1/twilio/sms/status
+    #   https://<host>/api/v1/twilio/whatsapp/status
+    TWILIO_SMS_STATUS_CALLBACK_URL: str = ""
+    TWILIO_WHATSAPP_STATUS_CALLBACK_URL: str = ""
+
+    # --- Delivery polling / reconciliation (fallback to webhooks) ---
+    # When true, on-demand status polling (e.g. GET status -> query provider)
+    # is allowed as a fallback when no webhook is configured or a callback
+    # never arrives. DELIVERY_RECONCILIATION_ENABLED additionally enables a
+    # periodic reconciliation sweep of stuck submitted/sent messages.
+    DELIVERY_POLLING_ENABLED: bool = True
+    DELIVERY_POLLING_INTERVAL_SECONDS: int = 300
+    DELIVERY_RECONCILIATION_ENABLED: bool = False
 
     # --- Email templates ---
     # Directory holding channel templates. Email templates are HTML files that
@@ -246,6 +295,11 @@ class Settings(BaseSettings):
     def twilio_whatsapp_from(self) -> str:
         """WhatsApp sender number, falling back to the shared Twilio sender."""
         return self.TWILIO_WHATSAPP_FROM or self.TWILIO_FROM
+
+    @property
+    def auth_client_secret_effective(self) -> str:
+        """Login credential: AUTH_CLIENT_SECRET, else AUTH_API_KEY."""
+        return self.AUTH_CLIENT_SECRET or self.AUTH_API_KEY
 
     @property
     def twilio_whatsapp_templates(self) -> dict:

@@ -184,11 +184,12 @@ def test_migration_adds_content_hash_to_existing_db(mig_settings):
     conn.close()
 
     n = migrate.up()
-    assert n == 1  # only 0004 applied
+    assert n == 2  # 0004 (content_hash) + 0005 (delivered_at) applied
 
     conn = sqlite3.connect(mig_settings)
     columns = {r[1] for r in conn.execute("PRAGMA table_info(notifications)")}
     assert "content_hash" in columns
+    assert "delivered_at" in columns
     conn.close()
 
 

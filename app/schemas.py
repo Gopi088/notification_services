@@ -15,6 +15,20 @@ class Channel(str, Enum):
     sms = "sms"
     email = "email"
 
+    @classmethod
+    def _missing_(cls, value):
+        """Normalize channel input: trim + case-insensitive match.
+
+        "sms", "SMS", " Sms ", "EMAIL", "WhatsApp" all resolve to the same
+        member. Unsupported channels still raise the normal validation error.
+        """
+        if isinstance(value, str):
+            norm = value.strip().lower()
+            for member in cls:
+                if member.value == norm:
+                    return member
+        return None
+
 
 # Internally we may add channels (telegram, push, ...) without touching the
 # public v1 enum above. Channels are validated at the API layer.
@@ -115,6 +129,7 @@ class SendRequest(BaseModel):
 
 
 class ChannelQueued(BaseModel):
+    model_config = {"extra": "ignore"}
     message_id: str
     channel: str
     status: Status
@@ -144,6 +159,7 @@ class ChannelStatus(BaseModel):
     provider: Optional[str] = None
     provider_message_id: Optional[str] = None
     error: Optional[str] = None
+    retry_count: int = 0
     created_at: str
     updated_at: str
     # Seconds elapsed since the message was created (how long to wait so far).
@@ -152,9 +168,16 @@ class ChannelStatus(BaseModel):
     timed_out: bool = False
     delivery_timeout_seconds: Optional[int] = None
     # Acknowledgement (user response) fields.
+    delivered_at: Optional[str] = None
     read_at: Optional[str] = None
     acknowledged_at: Optional[str] = None
     acknowledgement_type: Optional[str] = None
+    # How this provider confirms delivery: "webhook", "polling", or
+    # "unavailable". The service never fakes delivered - when confirmation is
+    # unavailable the message stays submitted.
+    delivery_confirmation: str = "unavailable"
+    # Lifecycle timeline (queued -> processing -> submitted -> ...).
+    history: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class StatusResponse(BaseModel):
@@ -296,3 +319,33 @@ class HealthResponse(BaseModel):
     service: str
     version: str
     mock_mode: bool
+
+
+class CandidateMessage(BaseModel):
+    """One notification record in a candidate report."""
+
+    message_id: str
+    channel: str
+    contact: str
+    status: str
+    provider: Optional[str] = None
+    provider_message_id: Optional[str] = None
+    created_at: str
+    updated_at: str
+    delivered_at: Optional[str] = None
+    read_at: Optional[str] = None
+    retry_count: int = 0
+    error: Optional[str] = None
+    group_id: Optional[str] = None
+    reference: Optional[str] = None
+    resend_count: int = 0
+
+
+class CandidateReport(BaseModel):
+    """Communication report for a candidate/contact."""
+
+    candidate_id: str
+    total_messages: int
+    by_channel: Dict[str, int] = Field(default_factory=dict)
+    by_status: Dict[str, int] = Field(default_factory=dict)
+    messages: List[CandidateMessage] = Field(default_factory=list)

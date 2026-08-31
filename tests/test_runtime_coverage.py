@@ -48,7 +48,7 @@ def test_configuration_aliases_fall_back_to_legacy_values():
 
 
 def test_auth_dependency_covers_enabled_and_disabled_modes(monkeypatch):
-    from app.auth import require_api_key, user_id_from_request
+    from app.auth import require_auth, user_id_from_request, create_access_token
     from app.config import get_settings
 
     class Request:
@@ -56,24 +56,25 @@ def test_auth_dependency_covers_enabled_and_disabled_modes(monkeypatch):
 
     monkeypatch.setenv("AUTH_ENABLED", "false")
     get_settings.cache_clear()
-    assert require_api_key("") is None
+    assert require_auth("") == "anonymous"
     assert user_id_from_request(Request()).startswith("usr_")
 
     monkeypatch.setenv("AUTH_ENABLED", "true")
-    monkeypatch.setenv("AUTH_API_KEY", "secret-key")
+    monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-0123456789abcdef")
     get_settings.cache_clear()
-    assert require_api_key("secret-key") is None
+    token = create_access_token("client-1", "usr_jwt_1")
+    assert require_auth(f"Bearer {token}") == "usr_jwt_1"
     with pytest.raises(HTTPException) as missing:
-        require_api_key("")
+        require_auth("")
     assert missing.value.status_code == 401
     with pytest.raises(HTTPException) as wrong:
-        require_api_key("wrong-key")
+        require_auth("Bearer not.a.jwt")
     assert wrong.value.status_code == 401
 
-    monkeypatch.setenv("AUTH_API_KEY", "")
+    monkeypatch.setenv("JWT_SECRET_KEY", "")
     get_settings.cache_clear()
     with pytest.raises(HTTPException) as misconfigured:
-        require_api_key("any-key")
+        require_auth("Bearer x")
     assert misconfigured.value.status_code == 500
     get_settings.cache_clear()
 
