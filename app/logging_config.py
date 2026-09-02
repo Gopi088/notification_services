@@ -127,26 +127,18 @@ class PlainFormatter(logging.Formatter):
 
         %(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s   ·  key=value ...
 
-    When `use_colors=True` (default for TTY terminals):
-    - The WHOLE line is coloured for problems so they stand out immediately:
-      WARNING=yellow, ERROR=red, CRITICAL=magenta+bold.
-    - INFO/DEBUG keep a plain line but colour the level badge (green/cyan) and
-      dim the timestamp + structured fields so the message stays the focus.
-    File logs are never coloured.
+    When `use_colors=True` (default for TTY terminals) ONLY the log-level badge
+    is ANSI-coloured - DEBUG=blue, INFO=green, WARNING=yellow, ERROR=red,
+    CRITICAL=magenta. The timestamp, logger name and message stay plain so the
+    line remains readable. File logs are never coloured (use_colors=False).
     """
 
     _LEVEL_COLORS = {
-        "DEBUG": "\033[36m",            # cyan
+        "DEBUG": "\033[34m",            # blue
         "INFO": "\033[32m",             # green
         "WARNING": "\033[33m",          # yellow
         "ERROR": "\033[31m",            # red
-        "CRITICAL": "\033[35m\033[1m",  # magenta + bold
-    }
-    # Levels that colour the entire line, not just the level badge.
-    _LINE_COLORS = {
-        "WARNING": "\033[33m",           # yellow
-        "ERROR": "\033[31m",             # red
-        "CRITICAL": "\033[35m\033[1m",   # magenta + bold
+        "CRITICAL": "\033[35m",         # magenta
     }
     _DIM = "\033[2m"
     _RESET = "\033[0m"
@@ -181,16 +173,13 @@ class PlainFormatter(logging.Formatter):
         if not self.use_colors:
             return line
 
+        # Colour ONLY the log-level badge so problems stand out while the
+        # timestamp, logger name, and message stay plain/readable. File logs
+        # are never coloured (use_colors=False there).
         level = record.levelname
-        whole = self._LINE_COLORS.get(level)
-        if whole:
-            return f"{whole}{line}{self._RESET}"
-
         color = self._LEVEL_COLORS.get(level, "")
         if color:
             base = base.replace(level, f"{color}{level}{self._RESET}", 1)
-        ts = self.formatTime(record)
-        base = base.replace(ts, f"{self._DIM}{ts}{self._RESET}", 1)
         if tail:
             base += f"{self._DIM}{tail}{self._RESET}"
         return base

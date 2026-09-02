@@ -1,0 +1,71 @@
+{
+  "family": "__ECS_TASK_FAMILY__",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "__ECS_EXECUTION_ROLE_ARN__",
+  "taskRoleArn": "__ECS_TASK_ROLE_ARN__",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "containerDefinitions": [
+    {
+      "name": "notification-service",
+      "image": "__IMAGE_URI__",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "HOST", "value": "0.0.0.0"},
+        {"name": "PORT", "value": "8000"},
+        {"name": "MOCK_MODE", "value": "__MOCK_MODE__"},
+        {"name": "STORAGE_BACKEND", "value": "postgres"},
+        {"name": "QUEUE_ENABLED", "value": "__QUEUE_ENABLED__"},
+        {"name": "AUTH_ENABLED", "value": "__AUTH_ENABLED__"},
+        {"name": "LOG_LEVEL", "value": "INFO"},
+        {"name": "LOG_FORMAT", "value": "json"},
+        {"name": "LOG_COLORS", "value": "false"},
+        {"name": "LOG_FILE", "value": ""},
+        {"name": "AUDIT_LOG_FILE", "value": ""}
+      ],
+      "secrets": [
+        {"name": "DATABASE_URL", "valueFrom": "__ECS_SECRETS_ARN__:DATABASE_URL::"},
+        {"name": "REDIS_URL", "valueFrom": "__ECS_SECRETS_ARN__:REDIS_URL::"},
+        {"name": "REDIS_PASSWORD", "valueFrom": "__ECS_SECRETS_ARN__:REDIS_PASSWORD::"},
+        {"name": "JWT_SECRET_KEY", "valueFrom": "__ECS_SECRETS_ARN__:JWT_SECRET_KEY::"},
+        {"name": "AUTH_API_KEY", "valueFrom": "__ECS_SECRETS_ARN__:AUTH_API_KEY::"},
+        {"name": "AUTH_CLIENT_SECRET", "valueFrom": "__ECS_SECRETS_ARN__:AUTH_CLIENT_SECRET::"},
+        {"name": "COMMUNICATION_SERVICES_CONNECTION_STRING", "valueFrom": "__ECS_SECRETS_ARN__:COMMUNICATION_SERVICES_CONNECTION_STRING::"},
+        {"name": "VONAGE_API_KEY", "valueFrom": "__ECS_SECRETS_ARN__:VONAGE_API_KEY::"},
+        {"name": "VONAGE_API_SECRET", "valueFrom": "__ECS_SECRETS_ARN__:VONAGE_API_SECRET::"},
+        {"name": "TWILIO_ACCOUNT_SID", "valueFrom": "__ECS_SECRETS_ARN__:TWILIO_ACCOUNT_SID::"},
+        {"name": "TWILIO_AUTH_TOKEN", "valueFrom": "__ECS_SECRETS_ARN__:TWILIO_AUTH_TOKEN::"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "__CLOUDWATCH_LOG_GROUP__",
+          "awslogs-region": "__AWS_REGION__",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "python3 -c \"import http.client; c=http.client.HTTPConnection('localhost', 8000); c.request('GET', '/health'); raise SystemExit(0 if c.getresponse().status == 200 else 1)\""
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      }
+    }
+  ]
+}

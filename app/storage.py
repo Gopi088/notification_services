@@ -10,7 +10,10 @@ workers and webhook handlers. PostgreSQL is the durable source of truth; SQLite
 is kept for local development and tests.
 """
 import logging
+import os
 import sqlite3
+import threading
+import time
 import uuid
 
 try:
@@ -313,6 +316,12 @@ class Storage:
         short-lived operation connection; busy_timeout + synchronous=NORMAL
         are applied on every connection.
         """
+        # Ensure the parent directory exists; sqlite3.connect will fail if the
+        # directory does not exist.  Use exist_ok so this is a no-op after the
+        # first call (idempotent).
+        parent = os.path.dirname(os.path.abspath(self._sqlite_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         conn = sqlite3.connect(self._sqlite_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=30000")
@@ -379,12 +388,16 @@ class Storage:
         # Short-lived operation connection: WAL is already the file journal
         # mode (set once in connect()), so only busy_timeout/synchronous are
         # (re)applied here to keep per-request connection setup cheap.
+        _t0 = time.perf_counter()
         conn = self._sqlite_connect(set_wal=False)
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
+            from app.metrics import record
+
+            record("sqlite_op", (time.perf_counter() - _t0) * 1000)
 
     @contextmanager
     def _pg(self):
@@ -1097,23 +1110,27 @@ class Storage:
 
 
 _storage: Optional[Storage] = None
+_storage_lock = threading.RLock()
 
 
 def get_storage() -> Storage:
     global _storage
-    if _storage is None:
-        _storage = Storage()
-        _storage.connect()
-        # SQLite is single-process / dev: safe to auto-init schema.
-        # PostgreSQL schema is created by app/migrate.py (advisory-locked, idempotent)
-        # to avoid the pg_type_typname_nsp_index race from concurrent containers.
-        if _storage.backend != "postgres":
-            _storage.init_schema()
-    return _storage
+    with _storage_lock:
+        if _storage is None:
+            storage = Storage()
+            storage.connect()
+            # SQLite is single-process / dev: safe to auto-init schema.
+            # PostgreSQL schema is created by app/migrate.py (advisory-locked, idempotent)
+            # to avoid the pg_type_typname_nsp_index race from concurrent containers.
+            if storage.backend != "postgres":
+                storage.init_schema()
+            _storage = storage
+        return _storage
 
 
 def reset_storage() -> None:
     global _storage
-    if _storage is not None:
-        _storage.close()
-        _storage = None
+    with _storage_lock:
+        if _storage is not None:
+            _storage.close()
+            _storage = None

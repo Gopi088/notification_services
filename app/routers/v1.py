@@ -13,6 +13,7 @@ Design:
 """
 import datetime
 import logging
+import os
 import time
 import uuid
 from typing import Optional
@@ -29,6 +30,7 @@ from app.idempotency import (
     normalize_client_key,
     payload_hash,
 )
+from app.metrics import timed
 from app.logging_config import new_request_id
 from app.orchestrator import (
     get_group_summary,
@@ -50,7 +52,13 @@ from app.schemas import (
 )
 from app.audit import record_audit
 from app.storage import get_storage
-from app.validation import ContactValidationError, validate_contact
+from app.validation import (
+    ContactValidationError,
+    validate_attachment_limits,
+    validate_contact,
+    validate_message_limits,
+    validate_request_size,
+)
 
 logger = logging.getLogger("api.v1")
 
@@ -63,6 +71,13 @@ def _send_error(code: str, message: str, field: Optional[str] = None) -> HTTPExc
     return HTTPException(
         status_code=400,
         detail=ErrorResponse(error={"code": code, "message": message, "field": field}).model_dump(),
+    )
+
+
+def _payload_too_large(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=413,
+        detail=ErrorResponse(error={"code": "payload_too_large", "message": detail, "field": None}).model_dump(),
     )
 
 
@@ -154,6 +169,7 @@ def _store_idempotency_key(key: str, summary: dict) -> None:
     ),
     responses={400: {"model": ErrorResponse}, 422: {"model": ErrorResponse}, 429: {"model": ErrorResponse}},
 )
+@timed("request_send_total")
 def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Request,
          response: Response) -> SendResponse:
     request_id = _get_request_id(request)
@@ -164,6 +180,20 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
     payload._user_id = user_id
     logger.debug("send request parsed request_id=%s user_id=%s channel_count=%d",
                  request_id, user_id, len(payload.channels))
+
+    # ---- Payload limits (validate BEFORE processing/sending) ----
+    limit_err = (
+        validate_message_limits(payload.message, payload.channels)
+        or validate_request_size(payload)
+    )
+    if limit_err:
+        logger.warning("payload limit exceeded request_id=%s user_id=%s detail=%s",
+                       request_id, user_id, limit_err)
+        record_audit(
+            user_id=user_id, action="payload_limit_exceeded",
+            result="failure", failure_reason=limit_err, request_id=request_id,
+        )
+        raise _payload_too_large(limit_err)
 
     key_id = user_id  # rate-limit bucket keyed on the authenticated identity
 
@@ -448,6 +478,26 @@ def send_event(payload: NotificationEventRequest, background_tasks: BackgroundTa
         except ContactValidationError as exc:
             raise _send_error("validation_error", str(exc), field="deliveries") from exc
 
+    # ---- Payload limits (validate BEFORE processing/sending) ----
+    for delivery in payload.deliveries:
+        limit_err = (
+            validate_message_limits(
+                getattr(delivery.payload, "message", "") or "", [delivery.channel]
+            )
+            or validate_request_size(payload)
+            or validate_attachment_limits(
+                getattr(delivery.payload, "attachments", None)
+            )
+        )
+        if limit_err:
+            logger.warning("payload limit exceeded request_id=%s user_id=%s detail=%s",
+                           request_id, user_id, limit_err)
+            record_audit(
+                user_id=user_id, action="payload_limit_exceeded",
+                result="failure", failure_reason=limit_err, request_id=request_id,
+            )
+            raise _payload_too_large(limit_err)
+
     key_id = user_id  # rate-limit bucket keyed on the authenticated identity
     rl = check_api_send(key_id)
     if not rl.allowed:
@@ -635,3 +685,20 @@ def candidate_report(candidate_id: str, request: Request,
         by_status=by_status,
         messages=messages,
     )
+
+
+@router.get(
+    "/performance/metrics",
+    response_model=dict,
+    summary="Per-process performance metrics (when enabled)",
+    description=(
+        "Returns aggregated timing metrics (count/p50/p95/max/avg per operation) "
+        "collected by this process. Metrics are PER-PROCESS: with multiple "
+        "Uvicorn workers each worker reports its own view. Empty object when "
+        "PERFORMANCE_METRICS_ENABLED=false."
+    ),
+)
+def performance_metrics() -> dict:
+    from app.metrics import snapshot
+
+    return {"process_pid": os.getpid(), "metrics": snapshot()}

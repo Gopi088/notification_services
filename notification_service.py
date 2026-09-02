@@ -817,31 +817,20 @@ def do_audit(rest: list) -> None:
 
 
 _LOG_COLORS = {
-    "DEBUG": "[36m",
-    "INFO": "[32m",
-    "WARNING": "[33m",
-    "ERROR": "[31m",
-    "CRITICAL": "[35m[1m",
+    "DEBUG": "\033[34m",
+    "INFO": "\033[32m",
+    "WARNING": "\033[33m",
+    "ERROR": "\033[31m",
+    "CRITICAL": "\033[35m",
 }
-# Levels that colour the ENTIRE line so problems stand out in `logs` output.
-_LOG_LINE_COLORS = {
-    "WARNING": "[33m",
-    "ERROR": "[31m",
-    "CRITICAL": "[35m[1m",
-}
-_LOG_RESET = "[0m"
+_LOG_RESET = "\033[0m"
 
 
 def _colorize_log_line(line: str) -> str:
-    """Colour a log line read from the file for terminal display.
-
-    Warning/error/critical lines are coloured entirely (yellow/red/magenta)
-    so they stand out; other levels just colour the level token.
-    """
-    for tok, code in _LOG_LINE_COLORS.items():
-        needle = f" {tok} "
-        if needle in line or line.startswith(tok + " "):
-            return f"{code}{line}{_LOG_RESET}"
+    """Colour ONLY the log-level token in a log line read from the file for
+    terminal display.  DEBUG=blue, INFO=green, WARNING=yellow, ERROR=red,
+    CRITICAL=magenta.  The rest of the line stays plain so it remains readable.
+    File content is never modified."""
     for tok, code in _LOG_COLORS.items():
         needle = f" {tok} "
         if needle in line:

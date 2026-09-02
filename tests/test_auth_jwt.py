@@ -7,6 +7,9 @@ import pytest
 
 from app.providers.base import ProviderResult
 
+TEST_JWT_SECRET = "test-jwt-secret-key-0123456789abcdef"
+WRONG_TEST_JWT_SECRET = "wrong-jwt-secret-key-0123456789abcdef"
+
 
 @pytest.fixture(autouse=True)
 def jwt_env(monkeypatch):
@@ -14,7 +17,7 @@ def jwt_env(monkeypatch):
     from app.config import get_settings
 
     monkeypatch.setenv("AUTH_ENABLED", "true")
-    monkeypatch.setenv("JWT_SECRET_KEY", "test-jwt-secret-key")
+    monkeypatch.setenv("JWT_SECRET_KEY", TEST_JWT_SECRET)
     monkeypatch.setenv("JWT_ALGORITHM", "HS256")
     monkeypatch.setenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30")
     monkeypatch.setenv("AUTH_CLIENT_ID", "test-client")
@@ -43,7 +46,7 @@ def test_login_success(client):
     assert body["access_token"]
     assert body["user_id"] == "client_test-client"
     # Decode to verify the claims
-    claims = pyjwt.decode(body["access_token"], "test-jwt-secret-key", algorithms=["HS256"])
+    claims = pyjwt.decode(body["access_token"], TEST_JWT_SECRET, algorithms=["HS256"])
     assert claims["sub"] == "test-client"
     assert claims["user_id"] == "client_test-client"
 
@@ -99,7 +102,7 @@ def test_wrong_secret_returns_401(client):
     import datetime as dt
 
     payload = {"sub": "x", "user_id": "u", "exp": dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5)}
-    bad = pyjwt.encode(payload, "totally-different-secret", algorithm="HS256")
+    bad = pyjwt.encode(payload, WRONG_TEST_JWT_SECRET, algorithm="HS256")
     r = client.get("/api/v1/notifications/xyz/status", headers=_auth_headers(bad))
     assert r.status_code == 401
 
@@ -112,7 +115,7 @@ def test_expired_token_returns_401(client):
 
     payload = {"sub": "x", "user_id": "u",
                "exp": dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=5)}
-    expired = pyjwt.encode(payload, "test-jwt-secret-key", algorithm="HS256")
+    expired = pyjwt.encode(payload, TEST_JWT_SECRET, algorithm="HS256")
     r = client.get("/api/v1/notifications/xyz/status", headers=_auth_headers(expired))
     assert r.status_code == 401
 

@@ -91,7 +91,10 @@ class SendRequest(BaseModel):
     channels: List[ChannelRequest] = Field(
         ..., min_length=1, description="One or more channels to deliver through"
     )
-    message: str = Field(..., min_length=1, max_length=4096)
+    # Per-channel limits (SMS 1600 / WhatsApp 4096 / Email 100000) are enforced
+    # by the router with HTTP 413. The schema cap here is just a coarse safety
+    # ceiling so very large bodies reach the router instead of being cut off.
+    message: str = Field(..., min_length=1, max_length=1000000)
     reference: Optional[str] = Field(
         None, max_length=128, description="Caller-supplied reference, e.g. an order id"
     )
@@ -219,7 +222,7 @@ class SMSPayload(BaseModel):
     """Payload for an sms delivery."""
 
     recipient: str = Field(..., min_length=3, max_length=254)
-    message: str = Field(..., min_length=1, max_length=4096)
+    message: str = Field(..., min_length=1, max_length=1000000)
 
 
 class EmailAttachment(BaseModel):
@@ -235,6 +238,9 @@ class EmailAttachment(BaseModel):
         max_length=30000000,
         description="Base64-encoded file content (alternative to url; max 30 MB of encoded data)",
     )
+    pages: Optional[int] = Field(
+        None, ge=1, description="Page count for attached documents (max 100)"
+    )
 
 
 class EmailPayload(BaseModel):
@@ -242,7 +248,7 @@ class EmailPayload(BaseModel):
 
     recipient: str = Field(..., min_length=3, max_length=254)
     subject: Optional[str] = Field("Notification", max_length=200)
-    message: Optional[str] = Field(None, max_length=4096, description="Plain-text body")
+    message: Optional[str] = Field(None, max_length=1000000, description="Plain-text body")
     html: Optional[str] = Field(None, description="HTML body (overrides template rendering)")
     cc: Optional[List[str]] = Field(None, description="CC recipients")
     bcc: Optional[List[str]] = Field(None, description="BCC recipients")

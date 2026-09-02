@@ -71,6 +71,7 @@ AUDIT_EVENTS = {
     "login_failed",
     "authentication_failed",
     "candidate_report_queried",
+    "payload_limit_exceeded",
 }
 
 
@@ -145,6 +146,8 @@ def record_audit(*, user_id: Optional[str], action: str,
         "metadata": meta,
     }
 
+    _t0 = __import__("time").perf_counter()  # metrics: audit persistence time
+
     # 1) Durable DB table.
     try:
         audit_id = get_storage().record_audit(
@@ -160,6 +163,11 @@ def record_audit(*, user_id: Optional[str], action: str,
 
     # 2) Dedicated audit file (independent of DB availability).
     _append_audit_file(record)
+
+    # Record the total audit persistence time (no-op unless metrics enabled).
+    from app.metrics import record as _metric_record
+
+    _metric_record("audit_record", (__import__("time").perf_counter() - _t0) * 1000)
 
     # Informational app-log line (NOT the audit store).
     logger.info(

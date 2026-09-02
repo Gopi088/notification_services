@@ -5,6 +5,7 @@ Starts FastAPI, initializes the storage layer (SQLite or PostgreSQL), wires
 all routers, and exposes liveness/readiness/health endpoints.
 """
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -28,17 +29,15 @@ logger = logging.getLogger("app")
 
 settings = get_settings()
 
-app = FastAPI(
-    title=settings.APP_NAME,
-    description="Versioned notification service: send WhatsApp/SMS/Email messages via /api/v1 and track delivery status.",
-    version=__version__,
-)
-
-
-@app.on_event("startup")
 def on_startup() -> None:
     logger.info("application startup version=%s mock_mode=%s storage=%s queue=%s",
                 __version__, settings.MOCK_MODE, settings.STORAGE_BACKEND, settings.QUEUE_ENABLED)
+    # Lightweight per-process performance metrics (default off).
+    if s := get_settings().PERFORMANCE_METRICS_ENABLED:
+        from app.metrics import configure, start_periodic_logger
+
+        configure(True)
+        start_periodic_logger(get_settings().PERFORMANCE_METRICS_LOG_INTERVAL_SECONDS)
     # Warn loudly when authentication is disabled - /api/v1/* routes then work
     # without a Bearer token. In production AUTH_ENABLED must be true.
     s = get_settings()
@@ -83,13 +82,32 @@ def on_startup() -> None:
         logger.warning("legacy sqlite init skipped: %s", exc)
 
 
-@app.on_event("shutdown")
 def on_shutdown() -> None:
     logger.info("application shutdown starting")
+    from app.orchestrator import wait_for_mock_deliveries
     from app.storage import reset_storage
 
+    wait_for_mock_deliveries()
     reset_storage()
     logger.info("application shutdown complete")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Run application setup and teardown using FastAPI's current lifecycle API."""
+    on_startup()
+    try:
+        yield
+    finally:
+        on_shutdown()
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    description="Versioned notification service: send WhatsApp/SMS/Email messages via /api/v1 and track delivery status.",
+    version=__version__,
+    lifespan=lifespan,
+)
 
 
 @app.exception_handler(RequestValidationError)

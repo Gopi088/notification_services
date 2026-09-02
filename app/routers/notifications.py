@@ -26,7 +26,9 @@ logger = logging.getLogger("api.legacy")
 class LegacySendRequest(BaseModel):
     channel: Channel
     contact: str = Field(..., min_length=3, max_length=254)
-    message: str = Field(..., min_length=1, max_length=4096)
+    # Per-channel limits enforced by the router with HTTP 413; schema cap is a
+    # coarse safety ceiling so large bodies reach the limit check.
+    message: str = Field(..., min_length=1, max_length=1000000)
 
     @field_validator("contact")
     @classmethod
@@ -61,6 +63,27 @@ def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks, 
         validate_contact(payload.channel, payload.contact)
     except ContactValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # ---- Payload limits (validate BEFORE processing/sending) ----
+    from app.validation import validate_message_limits, validate_request_size
+
+    limit_err = (
+        validate_message_limits(payload.message, [payload.channel])
+        or validate_request_size(payload)
+    )
+    if limit_err:
+        from app.audit import record_audit
+
+        logger.warning("payload limit exceeded request_id=%s user_id=%s detail=%s",
+                       request_id, user_id, limit_err)
+        record_audit(
+            user_id=user_id, action="payload_limit_exceeded",
+            result="failure", failure_reason=limit_err, request_id=request_id,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail={"error": {"code": "payload_too_large", "message": limit_err, "field": None}},
+        )
 
     # Window-based duplicate detection (same user + channel + recipient +
     # message/template within DUPLICATE_WINDOW_MINUTES). The legacy route maps

@@ -14,6 +14,7 @@ redelivery / crashes never double-send.
 import hashlib
 import json
 import logging
+import time
 import uuid
 from typing import Dict, Optional, Tuple
 
@@ -83,6 +84,7 @@ def _redis():
 
 def check_redis(key: str) -> Optional[str]:
     """Return the stored notification_id for a key, or None (fast path)."""
+    _t0 = time.perf_counter()
     try:
         r = _redis()
         notification_id = r.get(f"idem:{key}")
@@ -91,14 +93,23 @@ def check_redis(key: str) -> Optional[str]:
     except Exception as exc:  # noqa: BLE001 - fail open to DB path
         logger.warning("idempotency redis check failed: %s", exc)
         return None
+    finally:
+        from app.metrics import record
+
+        record("redis_get", (time.perf_counter() - _t0) * 1000)
 
 
 def store_redis(key: str, notification_id: str, ex: Optional[int] = None) -> None:
+    _t0 = time.perf_counter()
     try:
         r = _redis()
         r.set(f"idem:{key}", notification_id, ex=ex or get_settings().IDEMPOTENCY_TTL_SECONDS)
     except Exception as exc:  # noqa: BLE001
         logger.warning("idempotency redis store failed: %s", exc)
+    finally:
+        from app.metrics import record
+
+        record("redis_set", (time.perf_counter() - _t0) * 1000)
 
 
 def claim_idempotency_key(key: str, notification_id: str, payload_hash: str,

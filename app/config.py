@@ -50,6 +50,19 @@ class Settings(BaseSettings):
     # the webhook; this threshold tells callers when to stop waiting.
     DELIVERY_TIMEOUT_SECONDS: int = 300
 
+    # --- Payload limits (production safety, configurable via .env) ---
+    # Maximum message length per channel. Enforced BEFORE processing/sending;
+    # exceeding the channel limit returns HTTP 413 with a clear error.
+    SMS_MAX_MESSAGE_LENGTH: int = 1600
+    WHATSAPP_MAX_MESSAGE_LENGTH: int = 4096
+    EMAIL_MAX_MESSAGE_LENGTH: int = 100000
+    # Maximum size of a single email attachment file (decoded bytes).
+    MAX_FILE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB
+    # Maximum number of pages in an attached document (email).
+    MAX_DOCUMENT_PAGES: int = 100
+    # Maximum total request payload size (serialized JSON bytes).
+    MAX_REQUEST_SIZE_BYTES: int = 12 * 1024 * 1024  # 12 MB
+
     # --- Duplicate detection ---
     # Window (minutes) during which sending the SAME content (user + channel +
     # recipient + message/template) to the same recipient is treated as a
@@ -121,9 +134,17 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     LOG_FORMAT: str = "text"  # "text" (dev) or "json" (structured)
     LOG_REDACT_KEYS: str = ""  # extra comma-separated field names to redact
+    # When true, lightweight in-process performance metrics are collected
+    # (request handler, SQLite, Redis, dispatch, audit timings) and exposed via
+    # GET /api/v1/performance/metrics plus a periodic summary log. Metrics are
+    # PER-PROCESS (each Uvicorn worker collects its own). Default off so the
+    # hot path is unchanged unless explicitly enabled.
+    PERFORMANCE_METRICS_ENABLED: bool = False
+    # Seconds between periodic aggregated-metrics log lines (metrics only).
+    PERFORMANCE_METRICS_LOG_INTERVAL_SECONDS: int = 60
     # When true (default) and LOG_FORMAT=text, terminal logs are ANSI-coloured
-    # by level (DEBUG cyan, INFO green, WARNING yellow, ERROR red, CRITICAL
-    # magenta+bold). File logs are never coloured.
+    # by level (DEBUG blue, INFO green, WARNING yellow, ERROR red, CRITICAL
+    # magenta). File logs are never coloured.
     LOG_COLORS: bool = True
     # Optional independent file level (standard threshold semantics). When
     # empty, the file handler uses LOG_LEVEL (but unlike the terminal, it does
@@ -166,6 +187,9 @@ class Settings(BaseSettings):
     # WhatsApp channels use Twilio instead of Vonage/Azure. Credentials from
     # the Twilio console -> Account -> API keys & tokens. NEVER commit real
     # secrets.
+    # Twilio Messages API base URL. Override for local dummy-provider testing
+    # (default: https://api.twilio.com). Never point production at a dummy.
+    TWILIO_API_BASE_URL: str = "https://api.twilio.com"
     TWILIO_ACCOUNT_SID: str = ""
     TWILIO_AUTH_TOKEN: str = ""
     # Sender number for the SMS channel (E.164, e.g. +17372508034).

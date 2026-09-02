@@ -37,7 +37,7 @@ from app.providers.base import (
 
 logger = logging.getLogger("twilio_provider")
 
-_MESSAGES_URL = "https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json"
+_MESSAGES_URL = "{base}/2010-04-01/Accounts/{sid}/Messages.json"
 
 # Error markers in the Twilio response body that mean "free-form text is not
 # allowed here - use an approved template instead".
@@ -69,8 +69,8 @@ def _content_variables(params: Optional[Dict[str, str]]) -> Optional[str]:
 class _TwilioMixin:
     """Shared auth, request and error handling for the Twilio Messages API."""
 
-    def _messages_url(self, sid: str) -> str:
-        return _MESSAGES_URL.format(sid=sid)
+    def _messages_url(self, s) -> str:
+        return _MESSAGES_URL.format(base=s.TWILIO_API_BASE_URL, sid=s.TWILIO_ACCOUNT_SID)
 
     def _check_config(self, s) -> None:
         if not s.TWILIO_ACCOUNT_SID or not s.TWILIO_AUTH_TOKEN:
@@ -116,7 +116,7 @@ class _TwilioMixin:
             return None
         try:
             url = (
-                f"https://api.twilio.com/2010-04-01/Accounts/"
+                f"{s.TWILIO_API_BASE_URL}/2010-04-01/Accounts/"
                 f"{s.TWILIO_ACCOUNT_SID}/Messages/{provider_message_id}.json"
             )
             resp = requests.get(
@@ -129,7 +129,7 @@ class _TwilioMixin:
         return None
 
     def _post(self, s, data: Dict[str, str]) -> Dict:
-        url = self._messages_url(s.TWILIO_ACCOUNT_SID)
+        url = self._messages_url(s)
         try:
             resp = requests.post(
                 url,

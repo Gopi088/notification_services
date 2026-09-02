@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from app.config import get_settings
+from app.metrics import timed
 from app.providers.base import ProviderError, ProviderResult
 from app.providers.factory import get_provider
 from app.schemas import Channel, NotificationEventRequest, SendRequest
@@ -32,6 +33,9 @@ from app.storage import (
 )
 
 logger = logging.getLogger("orchestrator")
+
+_mock_delivery_threads: set[threading.Thread] = set()
+_mock_delivery_lock = threading.Lock()
 
 
 def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., ProviderResult]) -> None:
@@ -94,20 +98,42 @@ def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., Provide
         channel=channel.value, status="submitted",
         provider=result.provider_name,
     )
-    _maybe_simulate_delivery(notification_id)
+    _maybe_simulate_delivery(notification_id, storage=storage)
 
 
-def _maybe_simulate_delivery(notification_id: str) -> None:
+def _maybe_simulate_delivery(notification_id: str, *, storage=None) -> None:
     """In MOCK_MODE, simulate the delivery receipt a moment after the send so
     the full queued -> processing -> submitted -> delivered lifecycle is visible."""
     if not get_settings().MOCK_MODE:
         return
+    storage = storage or get_storage()
 
     def _go() -> None:
-        time.sleep(1.5)
-        get_storage().transition(notification_id, "delivered", actor="mock")
+        try:
+            time.sleep(1.5)
+            # Use the storage instance that created the notification. Looking
+            # it up again here can select a newly reset test database while
+            # this delayed receipt is still running.
+            storage.transition(notification_id, "delivered", actor="mock")
+        finally:
+            with _mock_delivery_lock:
+                _mock_delivery_threads.discard(thread)
 
-    threading.Thread(target=_go, daemon=True).start()
+    thread = threading.Thread(target=_go, daemon=True)
+    with _mock_delivery_lock:
+        _mock_delivery_threads.add(thread)
+    thread.start()
+
+
+def wait_for_mock_deliveries() -> None:
+    """Wait for simulated delivery receipts before their storage is torn down."""
+    while True:
+        with _mock_delivery_lock:
+            threads = tuple(_mock_delivery_threads)
+        if not threads:
+            return
+        for thread in threads:
+            thread.join()
 
 
 def _send_one(
@@ -137,6 +163,7 @@ def _send_one(
     _safe_send(notification_id, channel, _do)
 
 
+@timed("notification_dispatch")
 def _dispatch(notification_id: str, channel: Channel, cr, message: str,
               params: Optional[Dict], group_id: str, reference: Optional[str],
               background_tasks) -> None:

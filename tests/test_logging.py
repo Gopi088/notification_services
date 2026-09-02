@@ -481,26 +481,29 @@ def test_log_level_filter_predicate():
 
 
 def test_plain_formatter_colors_levels():
-    """PlainFormatter colours problems as a whole red/yellow line; INFO/DEBUG
-    colour only the level badge."""
+    """PlainFormatter colours ONLY the level badge (not the whole line)."""
     import io
     import logging
 
     from app.logging_config import PlainFormatter
 
-    fmt = PlainFormatter("%(levelname)s %(message)s", use_colors=True)
+    fmt = PlainFormatter("%(asctime)s %(levelname)s %(message)s", use_colors=True)
 
     def _fmt(level):
-        rec = logging.LogRecord("t", level, __file__, 1, "msg", None, None)
+        rec = logging.LogRecord("t", level, __file__, 1, "plain-msg", None, None)
         return fmt.format(rec)
 
+    # All levels colour only the badge, not the whole line.
     assert "\033[32mINFO\033[0m" in _fmt(logging.INFO)
-    assert "\033[36mDEBUG\033[0m" in _fmt(logging.DEBUG)
-    # WARNING / ERROR / CRITICAL colour the entire line, not just the badge.
-    assert _fmt(logging.WARNING).startswith("\033[33m") and _fmt(logging.WARNING).endswith("\033[0m")
-    assert _fmt(logging.ERROR).startswith("\033[31m") and _fmt(logging.ERROR).endswith("\033[0m")
-    crit = _fmt(logging.CRITICAL)
-    assert crit.startswith("\033[35m\033[1m") and crit.endswith("\033[0m")
+    assert "\033[34mDEBUG\033[0m" in _fmt(logging.DEBUG)
+    assert "\033[33mWARNING\033[0m" in _fmt(logging.WARNING)
+    assert "\033[31mERROR\033[0m" in _fmt(logging.ERROR)
+    assert "\033[35mCRITICAL\033[0m" in _fmt(logging.CRITICAL)
+    # No level colours the entire line and the message stays plain.
+    for level in (logging.WARNING, logging.ERROR, logging.CRITICAL):
+        formatted = _fmt(level)
+        assert not formatted.startswith("\033["), f"level {level} unexpectedly colours the whole line"
+        assert formatted.endswith("plain-msg")
 
 
 def test_plain_formatter_no_colors_when_disabled():
@@ -517,11 +520,18 @@ def test_cli_colorize_log_line():
     from notification_service import _colorize_log_line
 
     out = _colorize_log_line("2026-01-01 ERROR app: boom")
-    assert out.startswith("\033[31m") and out.endswith("\033[0m")
+    assert "\033[31mERROR\033[0m" in out
     assert "boom" in out
+    assert not out.startswith("\033[31m")  # badge only, not the whole line
     info = _colorize_log_line("2026-01-01 INFO app: ok")
     assert "\033[32mINFO\033[0m" in info
     assert not info.startswith("\033[32m")
+    debug = _colorize_log_line("2026-01-01 DEBUG app: dbg")
+    assert "\033[34mDEBUG\033[0m" in debug
+    warning = _colorize_log_line("2026-01-01 WARNING app: w")
+    assert "\033[33mWARNING\033[0m" in warning
+    crit = _colorize_log_line("2026-01-01 CRITICAL app: c")
+    assert "\033[35mCRITICAL\033[0m" in crit
 
 
 def test_configure_logging_terminal_colors(monkeypatch):

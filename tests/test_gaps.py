@@ -189,3 +189,35 @@ def test_maybe_simulate_delivery_mock(storage, monkeypatch):
     time.sleep(2)
     row = storage.get_notification(nid)
     assert row["status"] == "delivered"
+
+
+def test_mock_delivery_keeps_its_originating_storage(storage, monkeypatch):
+    """A delayed mock receipt must not resolve a different storage after reset."""
+    import threading
+
+    import app.orchestrator as orchestrator
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "MOCK_MODE", True)
+    release_delivery = threading.Event()
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda _delay: release_delivery.wait(2))
+
+    nid = storage.create_notification(
+        message_id="sim-origin-storage", channel="sms", recipient="+919887270348",
+        message="x", status="submitted",
+    )
+    orchestrator._maybe_simulate_delivery(nid, storage=storage)
+
+    def unexpected_storage_lookup():
+        raise AssertionError("mock delivery must use its originating storage")
+
+    monkeypatch.setattr(orchestrator, "get_storage", unexpected_storage_lookup)
+    # Match fixture/application teardown: the global singleton is gone before
+    # the delayed receipt is allowed to continue.
+    from app.storage import reset_storage
+
+    reset_storage()
+    release_delivery.set()
+    orchestrator.wait_for_mock_deliveries()
+
+    assert storage.get_notification(nid)["status"] == "delivered"

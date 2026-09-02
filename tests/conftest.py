@@ -54,15 +54,18 @@ def client(tmp_path):
 
     from app.config import get_settings
     from app.main import app
+    from app.orchestrator import wait_for_mock_deliveries
     from app.storage import get_storage, reset_storage
 
     db = str(tmp_path / "test.db")
     os.environ["DATABASE_PATH"] = db
     get_settings.cache_clear()
+    wait_for_mock_deliveries()
     reset_storage()
     get_storage()
     with TestClient(app) as c:
         yield c
+    wait_for_mock_deliveries()
     reset_storage()
 
 
@@ -72,12 +75,15 @@ def storage(tmp_path):
     import os
 
     from app.config import get_settings
+    from app.orchestrator import wait_for_mock_deliveries
     from app.storage import get_storage, reset_storage
 
     db = str(tmp_path / "storage.db")
     os.environ["DATABASE_PATH"] = db
     get_settings.cache_clear()
+    wait_for_mock_deliveries()
     reset_storage()
     s = get_storage()
     yield s
+    wait_for_mock_deliveries()
     reset_storage()

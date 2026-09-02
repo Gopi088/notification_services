@@ -63,6 +63,9 @@ def test_auth_dependency_covers_enabled_and_disabled_modes(monkeypatch):
     monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key-0123456789abcdef")
     get_settings.cache_clear()
     token = create_access_token("client-1", "usr_jwt_1")
+    # Clear the cache again in case a background thread (e.g. mock-delivery
+    # from a prior test) re-cached stale settings after the last cache_clear.
+    get_settings.cache_clear()
     assert require_auth(f"Bearer {token}") == "usr_jwt_1"
     with pytest.raises(HTTPException) as missing:
         require_auth("")

@@ -1,11 +1,33 @@
+# Never send local secrets or mutable runtime data to the Docker build context.
 .env
 .env.*
-__pycache__/
-*.pyc
+!.env.example
+.aws/
+credentials/
+secrets/
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
+*.secrets
+
+# Local development and test artifacts are not needed in the production image.
+.git/
 .venv/
 venv/
+__pycache__/
+.pytest_cache/
+.coverage
+*.pyc
+*.db
 notifications.db
-.git/
+logs/
+*.jsonl
+*.log
+tests/
+load_tests/
+deploy/
 .gitignore
 README.md
 docs/
