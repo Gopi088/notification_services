@@ -173,7 +173,9 @@ def test_azure_email_fetch_as_base64_success():
     resp.status_code = 200
     resp.headers = {"content-length": "5"}
     resp.iter_bytes.return_value = [b"hello"]
-    with patch("httpx.stream", return_value=MagicMock(__enter__=MagicMock(return_value=resp))):
+    dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+    with patch("socket.getaddrinfo", return_value=dns), \
+         patch("httpx.stream", return_value=MagicMock(__enter__=MagicMock(return_value=resp))):
         b64 = provider._fetch_as_base64("https://example.com/f.txt")
     assert b64 == "aGVsbG8="
 
@@ -182,7 +184,9 @@ def test_azure_email_fetch_redirect_rejected():
     provider = AzureEmailProvider()
     resp = MagicMock()
     resp.is_redirect = True
-    with patch("httpx.stream", return_value=MagicMock(__enter__=MagicMock(return_value=resp))):
+    dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+    with patch("socket.getaddrinfo", return_value=dns), \
+         patch("httpx.stream", return_value=MagicMock(__enter__=MagicMock(return_value=resp))):
         with pytest.raises(ProviderError):
             provider._fetch_as_base64("https://example.com/f.txt")
 
@@ -193,7 +197,9 @@ def test_azure_email_fetch_oversized():
     resp.is_redirect = False
     resp.status_code = 200
     resp.headers = {"content-length": str(30 * 1024 * 1024)}
-    with patch("httpx.stream", return_value=MagicMock(__enter__=MagicMock(return_value=resp))):
+    dns = [(2, 1, 6, "", ("93.184.216.34", 443))]
+    with patch("socket.getaddrinfo", return_value=dns), \
+         patch("httpx.stream", return_value=MagicMock(__enter__=MagicMock(return_value=resp))):
         with pytest.raises(ProviderError):
             provider._fetch_as_base64("https://example.com/big.bin")
 

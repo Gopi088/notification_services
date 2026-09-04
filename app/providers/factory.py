@@ -18,14 +18,35 @@ def get_provider(channel: Channel) -> NotificationProvider:
     settings = get_settings()
     twilio_ready = bool(settings.TWILIO_ACCOUNT_SID and settings.TWILIO_AUTH_TOKEN)
     if channel == Channel.sms:
-        # Prefer Twilio when configured, then Vonage, else Azure.
+        selected = settings.SMS_PROVIDER.strip().lower()
+        if selected == "twilio":
+            return TwilioSMSProvider()
+        if selected == "vonage":
+            return VonageSMSProvider()
+        if selected == "azure":
+            return AzureSMSProvider()
+        # ``auto`` is intentionally limited to compatibility/local use.
+        if selected != "auto":
+            raise ValueError("SMS_PROVIDER must be one of: azure, vonage, twilio, auto")
+        if not settings.MOCK_MODE:
+            raise ValueError("SMS_PROVIDER=auto is not allowed when MOCK_MODE=false; select a provider explicitly")
         if twilio_ready and settings.TWILIO_FROM:
             return TwilioSMSProvider()
         if settings.VONAGE_API_KEY and settings.VONAGE_API_SECRET:
             return VonageSMSProvider()
         return AzureSMSProvider()
     if channel == Channel.whatsapp:
-        # Prefer Twilio when configured, then Vonage, else Azure.
+        selected = settings.WHATSAPP_PROVIDER.strip().lower()
+        if selected == "twilio":
+            return TwilioWhatsAppProvider()
+        if selected == "vonage":
+            return VonageWhatsAppProvider()
+        if selected == "azure":
+            return AzureWhatsAppProvider()
+        if selected != "auto":
+            raise ValueError("WHATSAPP_PROVIDER must be one of: azure, vonage, twilio, auto")
+        if not settings.MOCK_MODE:
+            raise ValueError("WHATSAPP_PROVIDER=auto is not allowed when MOCK_MODE=false; select a provider explicitly")
         if twilio_ready and settings.twilio_whatsapp_from:
             return TwilioWhatsAppProvider()
         if settings.VONAGE_WHATSAPP_FROM and settings.VONAGE_API_KEY and settings.VONAGE_API_SECRET:

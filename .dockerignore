@@ -21,6 +21,9 @@ __pycache__/
 .coverage
 *.pyc
 *.db
+*.db.*
+*.sqlite
+*.sqlite.*
 notifications.db
 logs/
 *.jsonl
@@ -28,6 +31,9 @@ logs/
 tests/
 load_tests/
 deploy/
+.agents/
+.codex/
+.kilo/
 .gitignore
 README.md
 docs/

@@ -18,6 +18,7 @@ import logging
 from typing import Optional
 
 from app.audit import record_audit
+from app.providers.base import sanitize_provider_error
 from app.storage import get_storage
 
 logger = logging.getLogger("delivery_status")
@@ -64,6 +65,7 @@ def update_delivery_status(
     no-op due to idempotency). Returns False when the notification is unknown
     (provider_message_id not found).
     """
+    error = sanitize_provider_error(error) if error else None
     storage = get_storage()
     notif = storage.get_by_provider_message_id(provider_message_id)
     if notif is None:
@@ -73,6 +75,21 @@ def update_delivery_status(
             payload={"error": error} if error else {},
         )
         logger.info("[%s] status for unknown message %s status=%s", provider, provider_message_id, provider_status)
+        return False
+
+    # A provider identifier is only meaningful within that provider/channel.
+    # Refuse a mismatched callback rather than allowing a guessed identifier
+    # to mutate a notification owned by another integration.
+    stored_provider = (notif.get("provider") or "").lower()
+    provider_family = provider.lower().split("_", 1)[0]
+    stored_family = stored_provider.split("_", 1)[0]
+    if stored_provider and stored_family != provider_family:
+        logger.warning("webhook provider mismatch sid=%s expected=%s received=%s",
+                       provider_message_id, stored_provider, provider)
+        return False
+    if channel and notif.get("channel") != channel:
+        logger.warning("webhook channel mismatch sid=%s expected=%s received=%s",
+                       provider_message_id, notif.get("channel"), channel)
         return False
 
     target = STATUS_MAP.get(provider_status.lower())

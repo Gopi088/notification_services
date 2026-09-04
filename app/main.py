@@ -41,6 +41,16 @@ def on_startup() -> None:
     # Warn loudly when authentication is disabled - /api/v1/* routes then work
     # without a Bearer token. In production AUTH_ENABLED must be true.
     s = get_settings()
+    # A non-mock service is a production-like runtime.  Do not permit it to
+    # start against an ephemeral SQLite file or without the durable worker
+    # transport.  Unit tests stay isolated by using MOCK_MODE=true.
+    if not s.MOCK_MODE:
+        if s.STORAGE_BACKEND.lower() not in {"postgres", "postgresql"} or not s.DATABASE_URL:
+            raise RuntimeError("MOCK_MODE=false requires STORAGE_BACKEND=postgres and DATABASE_URL.")
+        if not s.QUEUE_ENABLED or s.QUEUE_BACKEND.lower() != "redis":
+            raise RuntimeError("MOCK_MODE=false requires QUEUE_ENABLED=true and QUEUE_BACKEND=redis.")
+        if not s.AUTH_ENABLED:
+            raise RuntimeError("MOCK_MODE=false requires AUTH_ENABLED=true.")
     if not s.AUTH_ENABLED and not s.MOCK_MODE:
         logger.warning(
             "AUTH_ENABLED=false: /api/v1/* routes are NOT authenticated. Set "
@@ -73,13 +83,16 @@ def on_startup() -> None:
 
     n = run_migrations()
     logger.info("migrations applied this startup: %s", n)
-    # Keep legacy SQLite table available for backward-compatible tooling.
-    try:
-        from app.database import init_db
+    # Legacy tooling has a separate SQLite table.  It must never be created
+    # by a PostgreSQL deployment, where it would become an accidental second
+    # source of truth.
+    if s.STORAGE_BACKEND.lower() == "sqlite":
+        try:
+            from app.database import init_db
 
-        init_db()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("legacy sqlite init skipped: %s", exc)
+            init_db()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("legacy sqlite init skipped: %s", exc)
 
 
 def on_shutdown() -> None:
@@ -119,10 +132,17 @@ async def request_validation_error_handler(
         "request validation failed method=%s path=%s status=422 error_count=%d",
         request.method, request.url.path, len(exc.errors()),
     )
-    # jsonable_encoder makes every entry JSON-serializable: validator errors
-    # embed the raised exception in ctx.error, which would otherwise crash the
-    # JSONResponse with a TypeError (e.g. a duplicate-channel ValueError).
-    return JSONResponse(status_code=422, content={"detail": jsonable_encoder(exc.errors())})
+    # Do not return raw Pydantic internals (or submitted data). Every API error
+    # follows the documented public envelope.
+    errors = exc.errors()
+    loc = errors[0].get("loc", ()) if errors else ()
+    field = ".".join(str(part) for part in loc if part != "body") or None
+    return JSONResponse(
+        status_code=422,
+        content={"success": False, "error": {
+            "code": "validation_error", "message": "Request validation failed.", "field": field,
+        }},
+    )
 
 
 @app.exception_handler(HTTPException)
@@ -133,11 +153,15 @@ async def http_error_handler(request: Request, exc: HTTPException) -> JSONRespon
         "request rejected method=%s path=%s status=%d",
         request.method, request.url.path, exc.status_code,
     )
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-        headers=exc.headers,
-    )
+    if isinstance(exc.detail, dict) and exc.detail.get("success") is False and "error" in exc.detail:
+        content = exc.detail
+    else:
+        codes = {401: "unauthorized", 403: "forbidden", 404: "not_found", 409: "conflict", 429: "rate_limited"}
+        content = {"success": False, "error": {
+            "code": codes.get(exc.status_code, "request_error"),
+            "message": str(exc.detail), "field": None,
+        }}
+    return JSONResponse(status_code=exc.status_code, content=content, headers=exc.headers)
 
 
 @app.exception_handler(Exception)

@@ -30,7 +30,7 @@ def test_webhook_read_status_audit(client, storage):
         message_id=str(uuid.uuid4()), channel="whatsapp", recipient="+919887270348",
         message="x", status="submitted",
     )
-    storage.set_provider_info(nid, "vonage_whatsapp", pv)
+    storage.set_provider_info(nid, "azure_whatsapp", pv)
     r = client.post("/api/v1/whatsapp/webhook",
                     json=[{"data": {"channelType": "whatsapp", "messageId": pv, "status": "read"},
                            "eventType": "Microsoft.Communication.AdvancedMessageDeliveryStatusUpdated"}])

@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Dict, Optional
 
 from app.config import get_settings
+from app.providers.base import sanitize_provider_error
 
 logger = logging.getLogger("queue")
 
@@ -79,9 +80,10 @@ def publish(channel: str, notification_id: str, group_id: Optional[str],
                      notification_id, channel, attempt)
         return entry_id
     except Exception as exc:  # noqa: BLE001
+        safe_error = sanitize_provider_error(exc)
         logger.error("queue publish failed channel=%s notification_id=%s: %s",
-                     channel, notification_id, exc)
-        raise QueueError(f"queue publish failed: {exc}") from exc
+                     channel, notification_id, safe_error)
+        raise QueueError(f"queue publish failed: {safe_error}") from exc
 
 
 def publish_retry(channel: str, notification_id: str, group_id: Optional[str],
@@ -101,8 +103,9 @@ def publish_retry(channel: str, notification_id: str, group_id: Optional[str],
                      notification_id, channel, attempt)
         return entry_id
     except Exception as exc:  # noqa: BLE001
-        logger.error("queue retry publish failed notification_id=%s: %s", notification_id, exc)
-        raise QueueError(f"queue retry publish failed: {exc}") from exc
+        safe_error = sanitize_provider_error(exc)
+        logger.error("queue retry publish failed notification_id=%s: %s", notification_id, safe_error)
+        raise QueueError(f"queue retry publish failed: {safe_error}") from exc
 
 
 def publish_dlq(channel: str, notification_id: str, group_id: Optional[str],
@@ -122,8 +125,9 @@ def publish_dlq(channel: str, notification_id: str, group_id: Optional[str],
         )
         return entry_id
     except Exception as exc:  # noqa: BLE001
-        logger.error("queue dlq publish failed notification_id=%s: %s", notification_id, exc)
-        raise QueueError(f"queue dlq publish failed: {exc}") from exc
+        safe_error = sanitize_provider_error(exc)
+        logger.error("queue dlq publish failed notification_id=%s: %s", notification_id, safe_error)
+        raise QueueError(f"queue dlq publish failed: {safe_error}") from exc
 
 
 def ensure_group(channel: str) -> None:
@@ -159,8 +163,9 @@ def consume(channel: str, worker_id: str, count: int = 1, block_ms: Optional[int
         if "timeout" in str(exc).lower():
             logger.debug("queue consume blocked (no messages) channel=%s", channel)
             return []
-        logger.error("queue consume failed channel=%s: %s", channel, exc)
-        raise QueueError(f"queue consume failed: {exc}") from exc
+        safe_error = sanitize_provider_error(exc)
+        logger.error("queue consume failed channel=%s: %s", channel, safe_error)
+        raise QueueError(f"queue consume failed: {safe_error}") from exc
 
 
 def ack(channel: str, entry_id: str) -> None:
@@ -171,18 +176,20 @@ def ack(channel: str, entry_id: str) -> None:
 
 def claim_pending(channel: str, worker_id: str, min_idle_ms: Optional[int] = None) -> list:
     """Reclaim messages from dead workers (XAUTOCLAIM)."""
+    ensure_group(channel)
     r = _client()
     settings = get_settings()
     idle = min_idle_ms if min_idle_ms is not None else settings.QUEUE_VISIBILITY_TIMEOUT_MS
     try:
-        claimed, _ids, _ = r.xautoclaim(
+        _next_id, claimed, _deleted = r.xautoclaim(
             stream_name(channel), settings.QUEUE_CONSUMER_GROUP, worker_id,
             min_idle_time=idle, start_id="0-0", count=20,
         )
         return claimed
     except Exception as exc:  # noqa: BLE001
-        logger.error("queue claim_pending failed channel=%s: %s", channel, exc)
-        raise QueueError(f"queue claim failed: {exc}") from exc
+        safe_error = sanitize_provider_error(exc)
+        logger.error("queue claim_pending failed channel=%s: %s", channel, safe_error)
+        raise QueueError(f"queue claim failed: {safe_error}") from exc
 
 
 def queue_length(channel: str) -> int:

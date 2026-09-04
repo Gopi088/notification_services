@@ -32,7 +32,11 @@ def test_worker_unexpected_exception(storage, fake_redis_client):
                                      "recipient": "+919887270348", "attempt": 1})
     assert ok is True
     row = storage.get_notification(nid)
-    assert row["status"] == "processing" or row["status"] == "failed"
+    # Unexpected provider failures must be recoverable, not left processing
+    # after their Redis stream entry has been acknowledged.
+    assert row["status"] == "retrying"
+    from app import queue as q
+    assert fake_redis_client.xlen(q.retry_stream_name()) == 1
 
 
 def test_process_retry_stream_moves_due(fake_redis_client, storage):

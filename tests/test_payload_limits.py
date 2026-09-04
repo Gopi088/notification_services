@@ -161,7 +161,10 @@ def test_email_attachment_file_and_page_limits(client, monkeypatch):
                 "payload": {
                     "recipient": "user@example.com",
                     "message": "hi",
-                    "attachments": [{"name": "doc.pdf", "pages": 101}],
+                        "attachments": [{
+                            "name": "doc.pdf", "pages": 101,
+                            "content_base64": base64.b64encode(b"pdf").decode(),
+                        }],
                 },
             }]},
         )

@@ -138,7 +138,7 @@ def _seed_notification_with_provider_id(message_id: str, provider_id: str, chann
         message="test", status="submitted",
     )
     # Attach provider info directly (status stays submitted).
-    storage.set_provider_info(nid, "vonage_whatsapp", provider_id)
+    storage.set_provider_info(nid, "azure_whatsapp", provider_id)
     return nid
 
 

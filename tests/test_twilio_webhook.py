@@ -22,7 +22,7 @@ def _mk_notification(storage, provider_id=None, channel="whatsapp", status="subm
         message_id=str(uuid.uuid4()), channel=channel, recipient="+919887270348",
         message="x", status=status,
     )
-    storage.set_provider_info(nid, "twilio_whatsapp", pv)
+    storage.set_provider_info(nid, "twilio_sms" if channel == "sms" else "twilio_whatsapp", pv)
     return nid, pv
 
 
@@ -83,9 +83,10 @@ def test_twilio_webhook_unknown_message_ignored(client, storage):
     assert r.status_code == 200
 
 
-def test_twilio_webhook_missing_fields_ignored(client):
+def test_twilio_webhook_missing_fields_rejected(client):
     r = _post(client, {"MessageStatus": "delivered"})
-    assert r.status_code == 200
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "validation_error"
 
 
 def test_twilio_webhook_sms_status_updates_sms_notification(client, storage):
@@ -148,6 +149,7 @@ def test_delivery_status_shared_service_sms(storage, monkeypatch):
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACshared")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
     monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    monkeypatch.setenv("SMS_PROVIDER", "twilio")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -173,9 +175,9 @@ def test_delivery_status_shared_service_whatsapp_read(storage, monkeypatch):
     get_settings.cache_clear()
 
     nid, pv = _mk_notification(storage, channel="whatsapp")
-    update_delivery_status("whatsapp", pv, "delivered", channel="whatsapp")
+    update_delivery_status("twilio_whatsapp", pv, "delivered", channel="whatsapp")
     assert storage.get_notification(nid)["status"] == "delivered"
-    update_delivery_status("whatsapp", pv, "read", channel="whatsapp")
+    update_delivery_status("twilio_whatsapp", pv, "read", channel="whatsapp")
     assert storage.get_notification(nid)["status"] == "read"
     get_settings.cache_clear()
 
@@ -188,10 +190,10 @@ def test_webhook_get_endpoints_acknowledge(client):
     assert client.get("/api/v1/twilio/whatsapp/status").status_code == 200
 
 
-def test_webhook_missing_fields_ignored(client):
-    """Callbacks without a MessageSid/MessageStatus are acknowledged, not 500."""
-    assert client.post("/api/v1/sms/webhook", data={"MessageStatus": "delivered"}).status_code == 200
-    assert client.post("/api/v1/sms/webhook", data={"MessageSid": "SM123"}).status_code == 200
+def test_webhook_missing_fields_rejected(client):
+    """Malformed callbacks are rejected using the documented error envelope."""
+    assert client.post("/api/v1/sms/webhook", data={"MessageStatus": "delivered"}).status_code == 400
+    assert client.post("/api/v1/sms/webhook", data={"MessageSid": "SM123"}).status_code == 400
 
 
 def test_webhook_valid_signature_accepted(monkeypatch, client, storage):
@@ -257,17 +259,17 @@ def test_twilio_whatsapp_status_event_type_read(client, storage):
     assert row["read_at"] is not None
 
 
-def test_twilio_status_missing_message_sid(client):
-    """A callback without MessageSid is acknowledged, not 500."""
+def test_twilio_status_missing_message_sid_rejected(client):
+    """A callback without MessageSid is malformed and must be rejected."""
     r = client.post("/api/v1/twilio/sms/status", data={"MessageStatus": "delivered"})
-    assert r.status_code == 200
+    assert r.status_code == 400
 
 
-def test_twilio_status_unsupported_status_ignored(client, storage):
-    """An unsupported Twilio status is acknowledged without changing state."""
+def test_twilio_status_unsupported_status_rejected(client, storage):
+    """Unsupported provider statuses are rejected without changing state."""
     nid, pv = _mk_notification(storage, channel="sms")
     r = client.post("/api/v1/twilio/sms/status", data={"MessageSid": pv, "MessageStatus": "unknownthing"})
-    assert r.status_code == 200
+    assert r.status_code == 400
     assert storage.get_notification(nid)["status"] == "submitted"
 
 
@@ -334,6 +336,7 @@ def test_delayed_webhook_after_poll_does_not_corrupt(client, storage, monkeypatc
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACdelayed")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
     monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    monkeypatch.setenv("SMS_PROVIDER", "twilio")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -386,6 +389,7 @@ def test_status_poll_transitions_submitted_to_delivered(client, storage, monkeyp
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACpoll")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
     monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    monkeypatch.setenv("SMS_PROVIDER", "twilio")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -441,6 +445,7 @@ def test_status_poll_unmapped_status_keeps_state(storage, monkeypatch):
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACpoll")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
     monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    monkeypatch.setenv("SMS_PROVIDER", "twilio")
     from app.config import get_settings
 
     get_settings.cache_clear()
@@ -465,6 +470,7 @@ def test_api_status_trigger_poll(client, storage, monkeypatch):
     monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACpollapi")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "tok")
     monkeypatch.setenv("TWILIO_FROM", "+17372508034")
+    monkeypatch.setenv("SMS_PROVIDER", "twilio")
     from app.config import get_settings
 
     get_settings.cache_clear()

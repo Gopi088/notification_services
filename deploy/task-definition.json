@@ -29,6 +29,8 @@
         {"name": "STORAGE_BACKEND", "value": "postgres"},
         {"name": "QUEUE_ENABLED", "value": "__QUEUE_ENABLED__"},
         {"name": "AUTH_ENABLED", "value": "__AUTH_ENABLED__"},
+        {"name": "SMS_PROVIDER", "value": "__SMS_PROVIDER__"},
+        {"name": "WHATSAPP_PROVIDER", "value": "__WHATSAPP_PROVIDER__"},
         {"name": "LOG_LEVEL", "value": "INFO"},
         {"name": "LOG_FORMAT", "value": "json"},
         {"name": "LOG_COLORS", "value": "false"},
@@ -46,7 +48,8 @@
         {"name": "VONAGE_API_KEY", "valueFrom": "__ECS_SECRETS_ARN__:VONAGE_API_KEY::"},
         {"name": "VONAGE_API_SECRET", "valueFrom": "__ECS_SECRETS_ARN__:VONAGE_API_SECRET::"},
         {"name": "TWILIO_ACCOUNT_SID", "valueFrom": "__ECS_SECRETS_ARN__:TWILIO_ACCOUNT_SID::"},
-        {"name": "TWILIO_AUTH_TOKEN", "valueFrom": "__ECS_SECRETS_ARN__:TWILIO_AUTH_TOKEN::"}
+        {"name": "TWILIO_AUTH_TOKEN", "valueFrom": "__ECS_SECRETS_ARN__:TWILIO_AUTH_TOKEN::"},
+        {"name": "WEBHOOK_SHARED_SECRET", "valueFrom": "__ECS_SECRETS_ARN__:WEBHOOK_SHARED_SECRET::"}
       ],
       "logConfiguration": {
         "logDriver": "awslogs",

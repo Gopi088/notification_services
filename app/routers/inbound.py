@@ -14,6 +14,7 @@ Endpoints:
     POST /api/v1/inbound                 normalized inbound message
     GET  /api/v1/inbound                 (optional) provider challenge/validation
 """
+import hmac
 import logging
 from typing import Any, Dict, Optional
 
@@ -21,6 +22,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.audit import record_audit
+from app.config import get_settings
 from app.storage import get_storage
 
 logger = logging.getLogger("inbound")
@@ -36,22 +38,50 @@ def inbound_validate():
 
 @router.post("", summary="Receive a recipient reply")
 async def inbound_receive(request: Request):
+    settings = get_settings()
+    if not settings.MOCK_MODE:
+        supplied = request.headers.get("X-Webhook-Secret", "")
+        if not settings.WEBHOOK_SHARED_SECRET or not hmac.compare_digest(
+            supplied, settings.WEBHOOK_SHARED_SECRET,
+        ):
+            logger.warning("inbound webhook rejected: invalid shared secret")
+            return _error(403, "unauthorized", "Webhook authentication failed.")
     try:
         payload = await request.json()
     except Exception:  # noqa: BLE001
-        payload = {}
+        return _error(400, "validation_error", "Webhook body must be valid JSON.")
+    if not isinstance(payload, dict):
+        return _error(400, "validation_error", "Inbound webhook body must be a JSON object.")
     return _handle_inbound(payload)
+
+
+def _error(status_code: int, code: str, message: str, field: Optional[str] = None) -> JSONResponse:
+    return JSONResponse(
+        {"success": False, "error": {"code": code, "message": message, "field": field}},
+        status_code=status_code,
+    )
+
+
+def _redact_raw(value: Any) -> Any:
+    """Do not persist incidental credentials from inbound provider payloads."""
+    secret_keys = {"authorization", "token", "secret", "password", "api_key", "apikey"}
+    if isinstance(value, dict):
+        return {key: "***" if key.lower() in secret_keys else _redact_raw(item)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_raw(item) for item in value]
+    return value
 
 
 def _handle_inbound(payload: Dict[str, Any]) -> JSONResponse:
     """Normalize + persist an inbound message from any provider."""
     storage = get_storage()
     # Accept both normalized and Vonage/Azure-ish shapes.
-    channel = (payload.get("channel") or payload.get("channel_type") or "sms").lower()
+    channel = (payload.get("channel") or payload.get("channel_type") or payload.get("channelType") or "sms").lower()
     to = payload.get("to") or payload.get("from") or ""  # inbound: provider's 'from' is the recipient
     from_number = payload.get("from") or payload.get("to") or ""
     text = payload.get("text") or payload.get("message") or payload.get("content") or ""
-    message_id = payload.get("message_id") or payload.get("message_uuid") or payload.get("id")
+    message_id = payload.get("message_id") or payload.get("message_uuid") or payload.get("messageId") or payload.get("id")
 
     # Vonage inbound: {from, to, text, message_uuid, channel}
     # Azure inbound: {from, to, message, messageId, channelType}
@@ -62,9 +92,12 @@ def _handle_inbound(payload: Dict[str, Any]) -> JSONResponse:
             from_number = data.get("from") or from_number
             message_id = data.get("messageId") or data.get("message_uuid") or message_id
 
-    if not text:
-        return JSONResponse({"status": "ok", "accepted": False,
-                             "error": "no text in inbound payload"})
+    if channel not in {"sms", "whatsapp"}:
+        return _error(400, "validation_error", "Inbound webhook channel must be sms or whatsapp.", "channel")
+    if not isinstance(text, str) or not text.strip():
+        return _error(400, "validation_error", "Inbound webhook requires non-empty text.", "text")
+    if len(text) > get_settings().WHATSAPP_MAX_MESSAGE_LENGTH:
+        return _error(413, "payload_too_large", "Inbound message exceeds the configured size limit.", "text")
 
     storage.record_inbound_message(
         channel=channel,
@@ -72,7 +105,7 @@ def _handle_inbound(payload: Dict[str, Any]) -> JSONResponse:
         to_number=str(to),
         text=str(text),
         provider_message_id=str(message_id) if message_id else None,
-        raw=payload,
+        raw=_redact_raw(payload),
     )
     record_audit(
         user_id="recipient",

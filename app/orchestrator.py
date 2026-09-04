@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.config import get_settings
 from app.metrics import timed
-from app.providers.base import ProviderError, ProviderResult
+from app.providers.base import ProviderError, ProviderResult, sanitize_provider_error
 from app.providers.factory import get_provider
 from app.schemas import Channel, NotificationEventRequest, SendRequest
 from app.storage import (
@@ -31,6 +31,7 @@ from app.storage import (
     TRANSITIONS,
     get_storage,
 )
+from app.errors import QueueUnavailableError
 
 logger = logging.getLogger("orchestrator")
 
@@ -58,27 +59,28 @@ def _safe_send(notification_id: str, channel: Channel, fn: Callable[..., Provide
     try:
         result = fn()
     except ProviderError as exc:
+        safe_error = sanitize_provider_error(exc)
         logger.warning(
             "message %s failed via %s: %s (retryable=%s)",
-            notification_id, channel.value, exc, getattr(exc, "retryable", False),
+            notification_id, channel.value, safe_error, getattr(exc, "retryable", False),
         )
         storage.transition(
             notification_id, FAILED, actor="orchestrator",
-            error=str(exc),
+            error=safe_error,
         )
         row = storage.get_notification(notification_id)
         record_audit(
             user_id=row.get("created_by") if row else None,
             action="notification_failed", notification_id=notification_id,
             channel=channel.value, status="failed", result="failure",
-            failure_reason=str(exc),
+            failure_reason=safe_error,
         )
         return
     except Exception as exc:  # noqa: BLE001 - never leave a message 'queued' forever
         logger.exception("unexpected error sending message %s", notification_id)
         storage.transition(
             notification_id, FAILED, actor="orchestrator",
-            error=f"Unexpected error: {exc}",
+            error="Unexpected provider failure.",
         )
         return
 
@@ -187,6 +189,13 @@ def _dispatch(notification_id: str, channel: Channel, cr, message: str,
         logger.debug("queue dispatch complete notification_id=%s channel=%s group_id=%s backend=%s",
                      notification_id, channel.value, group_id, settings.QUEUE_BACKEND)
     else:
+        if not settings.MOCK_MODE and settings.STORAGE_BACKEND.lower() in {"postgres", "postgresql"}:
+            # A process-local BackgroundTask is lost when an ECS task is
+            # restarted. PostgreSQL-backed production delivery must be owned
+            # by the Redis worker. SQLite remains supported for local use.
+            raise QueueUnavailableError(
+                "QUEUE_ENABLED=true is required when MOCK_MODE=false."
+            )
         background_tasks.add_task(
             _send_one,
             notification_id,

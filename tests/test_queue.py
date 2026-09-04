@@ -48,6 +48,20 @@ def test_consume_and_ack(fake_redis):
     assert pending is None or pending.get("pending", 0) == 0
 
 
+def test_claim_pending_returns_abandoned_messages(fake_redis):
+    """A new worker can recover a message left pending by a dead consumer."""
+    from app import queue as q
+
+    q.publish("sms", "n-reclaim", "g-1", "+919887270348", attempt=1)
+    entries = q.consume("sms", "dead-worker", block_ms=10)
+    assert entries
+    claimed = q.claim_pending("sms", "replacement-worker", min_idle_ms=0)
+    assert len(claimed) == 1
+    entry_id, fields = claimed[0]
+    assert "n-reclaim" in fields["payload"]
+    q.ack("sms", entry_id)
+
+
 def test_ensure_group_idempotent(fake_redis):
     from app import queue as q
 

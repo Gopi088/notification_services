@@ -202,10 +202,10 @@ def test_inbound_audit_recorded(client, storage):
     assert "notification_received" in actions
 
 
-def test_inbound_empty_text(client):
+def test_inbound_empty_text_rejected(client):
     r = client.post("/api/v1/inbound", json={"channel": "sms", "from": "+1", "text": ""})
-    assert r.status_code == 200
-    assert r.json()["accepted"] is False
+    assert r.status_code == 400
+    assert r.json()["error"]["code"] == "validation_error"
 
 
 def test_inbound_auto_reply(client, monkeypatch, storage):

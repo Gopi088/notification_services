@@ -184,7 +184,7 @@ def test_migration_adds_content_hash_to_existing_db(mig_settings):
     conn.close()
 
     n = migrate.up()
-    assert n == 2  # 0004 (content_hash) + 0005 (delivered_at) applied
+    assert n == 4  # 0004–0007, including production/inbound constraints
 
     conn = sqlite3.connect(mig_settings)
     columns = {r[1] for r in conn.execute("PRAGMA table_info(notifications)")}
@@ -228,8 +228,11 @@ def test_get_storage_does_not_autocreate_postgres_schema(monkeypatch):
     from app.storage import Storage, get_storage, reset_storage
 
     reset_storage()
-    with patch.object(Storage, "init_schema") as mock_init:
+    # This unit test verifies ownership of schema initialization; it must not
+    # require a live PostgreSQL server (integration tests cover that separately).
+    with patch.object(Storage, "connect") as mock_connect, patch.object(Storage, "init_schema") as mock_init:
         get_storage()
+        mock_connect.assert_called_once()
         mock_init.assert_not_called()  # PG schema not auto-created here
     reset_storage()
     get_settings.cache_clear()

@@ -15,6 +15,10 @@ os.environ["MOCK_MODE"] = "true"
 os.environ["STORAGE_BACKEND"] = "sqlite"
 os.environ["DATABASE_URL"] = ""
 os.environ["QUEUE_ENABLED"] = "false"
+# Factory compatibility tests exercise the legacy auto-selection branch.
+# Production defaults are explicit azure/vonage/twilio selections.
+os.environ["SMS_PROVIDER"] = "auto"
+os.environ["WHATSAPP_PROVIDER"] = "auto"
 os.environ["RATELIMIT_ENABLED"] = "false"
 os.environ["REDIS_URL"] = "redis://localhost:6379/15"
 os.environ["AUTH_ENABLED"] = "false"
@@ -27,6 +31,23 @@ os.environ["TWILIO_WHATSAPP_FROM"] = ""
 
 _tmp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["DATABASE_PATH"] = _tmp_db.name
+
+_TEST_ENVIRONMENT = {
+    "MOCK_MODE": "true",
+    "STORAGE_BACKEND": "sqlite",
+    "DATABASE_URL": "",
+    "QUEUE_ENABLED": "false",
+    "SMS_PROVIDER": "auto",
+    "WHATSAPP_PROVIDER": "auto",
+    "RATELIMIT_ENABLED": "false",
+    "REDIS_URL": "redis://localhost:6379/15",
+    "AUTH_ENABLED": "false",
+    "LOG_LEVEL": "ERROR",
+    "TWILIO_ACCOUNT_SID": "",
+    "TWILIO_AUTH_TOKEN": "",
+    "TWILIO_FROM": "",
+    "TWILIO_WHATSAPP_FROM": "",
+}
 
 
 def pytest_configure(config):
@@ -43,6 +64,26 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 import pytest  # noqa: E402
+
+from tests.asgi_testclient import ASGITestClient, install_test_runtime_compatibility  # noqa: E402
+
+install_test_runtime_compatibility()
+
+import fastapi.testclient  # noqa: E402
+
+fastapi.testclient.TestClient = ASGITestClient
+
+
+@pytest.fixture(autouse=True)
+def _reset_test_configuration():
+    """Keep direct ``os.environ`` changes in one test out of the next one."""
+    from app.config import get_settings
+
+    os.environ.update(_TEST_ENVIRONMENT)
+    get_settings.cache_clear()
+    yield
+    os.environ.update(_TEST_ENVIRONMENT)
+    get_settings.cache_clear()
 
 
 @pytest.fixture()

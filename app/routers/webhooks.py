@@ -11,6 +11,7 @@ Configure Azure Event Grid subscriptions to public HTTPS endpoints:
     https://<public-host>/api/v1/email/webhook
 """
 import copy
+import hmac
 import logging
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,6 +19,7 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.delivery_status import update_delivery_status
+from app.config import get_settings
 from app.storage import get_storage
 
 logger = logging.getLogger("webhooks")
@@ -113,8 +115,27 @@ async def webhook_validate(request: Request):
 @router.post("/whatsapp/webhook", summary="Receive Azure WhatsApp delivery events")
 @router.post("/email/webhook", summary="Receive Azure email delivery events")
 async def webhook_receive(request: Request):
-    body = await request.json()
+    settings = get_settings()
+    if not settings.MOCK_MODE:
+        supplied = request.headers.get("X-Webhook-Secret", "")
+        if not settings.WEBHOOK_SHARED_SECRET or not hmac.compare_digest(
+            supplied, settings.WEBHOOK_SHARED_SECRET,
+        ):
+            logger.warning("azure webhook rejected: invalid shared secret")
+            return JSONResponse({"success": False, "error": {
+                "code": "unauthorized", "message": "Webhook authentication failed.", "field": None,
+            }}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"success": False, "error": {
+            "code": "validation_error", "message": "Webhook body must be valid JSON.", "field": None,
+        }}, status_code=400)
     events = body if isinstance(body, list) else [body]
+    if not events or not all(isinstance(event, dict) for event in events):
+        return JSONResponse({"success": False, "error": {
+            "code": "validation_error", "message": "Webhook events must be JSON objects.", "field": None,
+        }}, status_code=400)
     logger.debug("webhook request parsed event_count=%d", len(events))
 
     for event in events:
@@ -132,7 +153,9 @@ async def webhook_receive(request: Request):
                 logger.info("validationResponse returned: %s", code)
                 return JSONResponse({"validationResponse": code})
             logger.warning("SubscriptionValidationEvent missing validationCode")
-            continue
+            return JSONResponse({"success": False, "error": {
+                "code": "validation_error", "message": "Subscription validation event is missing validationCode.", "field": "data.validationCode",
+            }}, status_code=400)
 
         # ---------- Email delivery report (Azure Email Communication Service) ----------
         # eventType: Microsoft.Communication.EmailDeliveryReportReceived
@@ -143,8 +166,9 @@ async def webhook_receive(request: Request):
             message_id = data.get("messageId") or data.get("message_id") or data.get("id") or ""
             status = (data.get("status") or "").lower()
             if not message_id or not status:
-                logger.debug("email delivery report ignored (missing messageId/status)")
-                continue
+                return JSONResponse({"success": False, "error": {
+                    "code": "validation_error", "message": "Email delivery event requires messageId and status.", "field": "data",
+                }}, status_code=400)
             # "Expanded" is an intermediate distribution-list event, not a
             # result - ignore it (shared service leaves it submitted).
             if status == "expanded":
@@ -164,12 +188,16 @@ async def webhook_receive(request: Request):
         # ---------- Delivery status events (WhatsApp) ----------
         data = event.get("data") if isinstance(event, dict) and isinstance(event.get("data"), dict) else event
         if data.get("channelType") not in (None, "whatsapp"):
-            continue
+            return JSONResponse({"success": False, "error": {
+                "code": "validation_error", "message": "Webhook channel does not match this endpoint.", "field": "data.channelType",
+            }}, status_code=400)
 
         provider_message_id = data.get("messageId") or data.get("message_id")
         status = data.get("status")
         if not provider_message_id or not status:
-            continue
+            return JSONResponse({"success": False, "error": {
+                "code": "validation_error", "message": "Delivery event requires messageId and status.", "field": "data",
+            }}, status_code=400)
         logger.debug("webhook delivery received notification_id=%s channel=whatsapp status=%s",
                      provider_message_id, status.lower())
 
@@ -183,7 +211,7 @@ async def webhook_receive(request: Request):
         # Delegate to the shared delivery-status service (correlation,
         # idempotency, out-of-order guard, history + audit).
         update_delivery_status(
-            provider="whatsapp",
+            provider="azure_whatsapp",
             provider_message_id=provider_message_id,
             provider_status=status.lower(),
             error=detail or None,

@@ -179,14 +179,14 @@ def test_webhook_non_whatsapp_event_ignored(client):
                     json=[{"data": {"channelType": "sms", "messageId": "x",
                                     "status": "delivered"},
                            "eventType": "Microsoft.Communication.AdvancedMessageDeliveryStatusUpdated"}])
-    assert r.status_code == 200
+    assert r.status_code == 400
 
 
 def test_webhook_missing_message_id_ignored(client):
     r = client.post("/api/v1/whatsapp/webhook",
                     json=[{"data": {"channelType": "whatsapp", "status": "delivered"},
                            "eventType": "Microsoft.Communication.AdvancedMessageDeliveryStatusUpdated"}])
-    assert r.status_code == 200
+    assert r.status_code == 400
 
 
 def test_main_exception_handler_classified_provider(client):

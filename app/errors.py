@@ -102,9 +102,9 @@ def classify_provider_error(error: Exception) -> AppError:
     from app.providers.base import ProviderConfigError, ProviderError
 
     if isinstance(error, ProviderConfigError):
-        return ConfigurationError(str(error))
+        return ConfigurationError("Provider configuration is invalid.")
     if isinstance(error, ProviderError):
         if getattr(error, "retryable", False):
-            return ProviderUnavailableError(str(error))
-        return ValidationError(str(error))
+            return ProviderUnavailableError("Notification provider is temporarily unavailable.")
+        return ValidationError("Notification provider rejected the request.")
     return AppError(str(error))

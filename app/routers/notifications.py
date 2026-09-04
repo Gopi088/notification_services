@@ -7,7 +7,7 @@ onto the same orchestrator so behavior stays consistent.
 import logging
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, Response
 from pydantic import BaseModel, Field, field_validator
 
 from app.auth import user_id_from_request
@@ -54,7 +54,8 @@ class LegacyError(BaseModel):
     summary="Queue a message for delivery (legacy single-channel API)",
     responses={400: {"model": LegacyError}},
 )
-def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks, request: Request) -> dict:
+def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks,
+                 request: Request, response: Response) -> dict:
     request_id = new_request_id(request.headers.get("X-Request-ID"))
     user_id = user_id_from_request(request)
     logger.debug("legacy send request parsed request_id=%s user_id=%s channel=%s",
@@ -107,10 +108,8 @@ def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks, 
                 )
                 logger.warning("legacy duplicate within window request_id=%s channel=%s",
                                request_id, payload.channel.value)
-                raise HTTPException(
-                    status_code=202,
-                    headers={"X-Idempotent-Replay": "true"},
-                    detail={
+                response.headers["X-Idempotent-Replay"] = "true"
+                return {
                         "message_id": original["message_id"],
                         "channel": original["channel"],
                         "contact": original["contact"],
@@ -118,8 +117,7 @@ def send_message(payload: LegacySendRequest, background_tasks: BackgroundTasks, 
                         "duplicate": True,
                         "message": "Message already sent recently. Resend?",
                         "resend": True,
-                    },
-                )
+                }
 
     request_payload = V1SendRequest(
         channels=[ChannelRequest(channel=payload.channel, contact=payload.contact)],

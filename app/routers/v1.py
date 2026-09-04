@@ -234,6 +234,7 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
         )
     logger.debug("send idempotency resolved request_id=%s user_id=%s source=%s",
                  request_id, user_id, "client" if header_key else "derived")
+    ph = payload_hash(payload.model_dump())
 
     # Server-derived keys expire after the duplicate window so the same content
     # can be sent again once the window has passed (a duplicate outside the
@@ -246,6 +247,14 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
     # Redis fast-path duplicate check.
     existing_id = check_redis(idem_key)
     if existing_id and not payload.resend:
+        durable = get_storage().find_idempotency_key_row(idem_key)
+        if header_key and durable and durable.get("payload_hash") != ph:
+            raise HTTPException(
+                status_code=409,
+                detail=ErrorResponse(error={"code": "idempotency_conflict",
+                                            "message": "Idempotency-Key was already used with a different payload.",
+                                            "field": "Idempotency-Key"}).model_dump(),
+            )
         existing = get_message_summary(existing_id)
         if existing and _is_duplicate(existing, header_key, duplicate_window):
             response.headers["X-Idempotent-Replay"] = "true"
@@ -310,13 +319,21 @@ def send(payload: SendRequest, background_tasks: BackgroundTasks, request: Reque
     from app.idempotency import claim_idempotency_key, store_redis
 
     pre_ids = [str(uuid.uuid4()) for _ in payload.channels]
-    ph = payload_hash(payload.model_dump())
     # ---- Check for an existing notification with this key ----
     import time as _time
 
     existing_row = get_storage().find_idempotency_key_row(idem_key)
     original_nid = existing_row.get("notification_id") if existing_row else None
     original = get_message_summary(original_nid) if original_nid else None
+
+    if (existing_row and header_key and not payload.resend
+            and existing_row.get("payload_hash") != ph):
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorResponse(error={"code": "idempotency_conflict",
+                                        "message": "Idempotency-Key was already used with a different payload.",
+                                        "field": "Idempotency-Key"}).model_dump(),
+        )
 
     if existing_row and original and not payload.resend:
         if _is_duplicate(original, header_key, duplicate_window):

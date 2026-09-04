@@ -21,9 +21,10 @@ import pytest
 
 from app.providers.base import ProviderResult
 
-# Keep MOCK_MODE=false so no background "mock delivery" thread is spawned by
-# _maybe_simulate_delivery (those threads raced with subsequent tests' DBs).
-os.environ["MOCK_MODE"] = "false"
+# SQLite is intentionally unit-test-only.  Keep the application in mock mode
+# while exercising SQLite concurrency; production-like runs require PostgreSQL
+# plus Redis and are covered separately.
+os.environ["MOCK_MODE"] = "true"
 
 
 def _concurrent_send(client, count: int, channel: str = "sms") -> dict:
@@ -192,7 +193,7 @@ def test_memory_queue_backend_api_send(monkeypatch):
 
     os.environ["QUEUE_ENABLED"] = "true"
     os.environ["QUEUE_BACKEND"] = "memory"
-    os.environ["MOCK_MODE"] = "false"
+    os.environ["MOCK_MODE"] = "true"
     from app.config import get_settings
 
     get_settings.cache_clear()

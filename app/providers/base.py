@@ -4,6 +4,7 @@ exception types used for consistent error handling across providers.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, Optional
 
 
@@ -21,6 +22,20 @@ class ProviderConfigError(ProviderError):
 
     def __init__(self, message: str):
         super().__init__(message, retryable=False, error_code="config_error")
+
+
+_SENSITIVE_ERROR_VALUE = re.compile(
+    r"(?i)\b(authorization|api[_ -]?key|token|secret|password|connection[_ -]?string)\b\s*[:=]\s*[^\s,;]+"
+)
+_URL_CREDENTIALS = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
+
+
+def sanitize_provider_error(error: Exception | str, *, limit: int = 512) -> str:
+    """Return a bounded provider diagnostic without credentials."""
+    message = str(error).replace("\n", " ").replace("\r", " ")
+    message = _SENSITIVE_ERROR_VALUE.sub(lambda match: f"{match.group(1)}=***", message)
+    message = _URL_CREDENTIALS.sub("://***:***@", message)
+    return message[:limit]
 
 
 @dataclass

@@ -5,6 +5,9 @@ The public contract is stable: request/response shapes are decoupled from the
 internal provider/model layer, so internals are never leaked to callers.
 """
 from enum import Enum
+import base64
+import binascii
+import re
 from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -217,6 +220,12 @@ class WhatsAppPayload(BaseModel):
         None, description="Approved Meta template (required to reach a new contact)"
     )
 
+    @model_validator(mode="after")
+    def require_message_or_template(self) -> "WhatsAppPayload":
+        if self.template is None and not (self.message or "").strip():
+            raise ValueError("whatsapp payload requires a non-empty message or template")
+        return self
+
 
 class SMSPayload(BaseModel):
     """Payload for an sms delivery."""
@@ -242,6 +251,38 @@ class EmailAttachment(BaseModel):
         None, ge=1, description="Page count for attached documents (max 100)"
     )
 
+    @model_validator(mode="after")
+    def require_one_content_source(self) -> "EmailAttachment":
+        has_url = bool((self.url or "").strip())
+        has_content = bool((self.content_base64 or "").strip())
+        if has_url == has_content:
+            raise ValueError("attachment requires exactly one of url or content_base64")
+        return self
+
+    @field_validator("content_base64")
+    @classmethod
+    def validate_base64(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        value = value.strip()
+        if not value:
+            return value
+        try:
+            base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("attachment content_base64 must be valid base64") from exc
+        return value
+
+
+_EMAIL_ADDRESS_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validated_email_address(value: str) -> str:
+    value = value.strip()
+    if not _EMAIL_ADDRESS_RE.fullmatch(value):
+        raise ValueError("must be a valid email address")
+    return value
+
 
 class EmailPayload(BaseModel):
     """Payload for an email delivery."""
@@ -260,6 +301,27 @@ class EmailPayload(BaseModel):
     )
 
     model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def require_content(self) -> "EmailPayload":
+        if not ((self.message or "").strip() or (self.html or "").strip() or self.attachments):
+            raise ValueError("email payload requires a non-empty message, html, or attachment")
+        return self
+
+    @field_validator("recipient", "replyTo")
+    @classmethod
+    def validate_email_address(cls, value: Optional[str]) -> Optional[str]:
+        return _validated_email_address(value) if value is not None else value
+
+    @field_validator("cc", "bcc")
+    @classmethod
+    def validate_email_addresses(cls, values: Optional[List[str]]) -> Optional[List[str]]:
+        if values is None:
+            return values
+        validated = [_validated_email_address(value) for value in values]
+        if len(set(address.lower() for address in validated)) != len(validated):
+            raise ValueError("recipient list must not contain duplicate addresses")
+        return validated
 
 
 class DeliveryRequest(BaseModel):
@@ -307,6 +369,14 @@ class NotificationEventRequest(BaseModel):
     deliveries: List[DeliveryRequest] = Field(
         ..., min_length=1, description="One delivery per channel"
     )
+
+    @field_validator("deliveries")
+    @classmethod
+    def reject_duplicate_delivery_channels(cls, values: List[DeliveryRequest]) -> List[DeliveryRequest]:
+        channels = [delivery.channel for delivery in values]
+        if len(channels) != len(set(channels)):
+            raise ValueError("each event delivery channel may appear only once")
+        return values
 
 
 class ErrorDetail(BaseModel):

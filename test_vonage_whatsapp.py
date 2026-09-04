@@ -38,6 +38,7 @@ def _test_env(**overrides):
         "VONAGE_API_KEY": "test-key",
         "VONAGE_API_SECRET": "test-secret",
         "VONAGE_WHATSAPP_FROM": "14157386102",
+        "WHATSAPP_PROVIDER": "vonage",
         "VONAGE_WHATSAPP_SANDBOX_URL": "https://messages-sandbox.nexmo.com/v1/messages",
         "AZURE_DEFAULT_COUNTRY_CODE": "91",
     }

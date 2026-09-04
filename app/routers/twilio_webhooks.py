@@ -33,10 +33,18 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 from app.config import get_settings
-from app.delivery_status import update_delivery_status
+from app.delivery_status import STATUS_MAP, update_delivery_status
 
 logger = logging.getLogger("twilio.webhook")
 router = APIRouter(prefix="/api/v1", tags=["twilio-webhook"])
+
+
+def _webhook_error(status_code: int, code: str, message: str, field: str | None = None) -> JSONResponse:
+    """Use the public API error envelope for rejected callback payloads."""
+    return JSONResponse(
+        {"success": False, "error": {"code": code, "message": message, "field": field}},
+        status_code=status_code,
+    )
 
 
 def _valid_signature(request: Request, form_body: str, url: str) -> bool:
@@ -69,7 +77,7 @@ async def _handle(request: Request, channel: Optional[str] = None) -> JSONRespon
 
     if not get_settings().MOCK_MODE and not _valid_signature(request, raw, str(request.url)):
         logger.warning("twilio webhook rejected: invalid signature")
-        return JSONResponse({"status": "rejected"}, status_code=403)
+        return _webhook_error(403, "unauthorized", "Webhook authentication failed.")
 
     message_sid = (form.get("MessageSid") or form.get("SmsSid") or "").strip()
     message_status = (form.get("MessageStatus") or "").strip().lower()
@@ -79,8 +87,9 @@ async def _handle(request: Request, channel: Optional[str] = None) -> JSONRespon
         message_status = "read"
 
     if not message_sid or not message_status:
-        logger.debug("twilio webhook ignored (missing MessageSid/MessageStatus)")
-        return JSONResponse({"status": "ok"})
+        return _webhook_error(400, "validation_error", "Twilio callback requires MessageSid and MessageStatus.")
+    if message_status not in STATUS_MAP:
+        return _webhook_error(400, "validation_error", "Twilio callback has an unsupported MessageStatus.", "MessageStatus")
 
     logger.debug(
         "twilio status callback received provider_message_id=%s provider_status=%s channel=%s event_type=%s",

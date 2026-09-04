@@ -20,7 +20,7 @@ from typing import Dict, Optional
 
 from app.config import get_settings
 from app.audit import record_audit
-from app.providers.base import ProviderConfigError, ProviderError
+from app.providers.base import ProviderConfigError, ProviderError, sanitize_provider_error
 from app.providers.factory import get_provider
 from app.retry import backoff_delay_ms, is_retryable_error
 from app.storage import (
@@ -68,17 +68,14 @@ def process_message(channel: str, payload: Dict) -> bool:
         )
         return True
 
-    # Optimistic guard: only 'queued' or 'retrying' may go to processing.
-    current = notification["status"]
-    if current not in ("queued", RETRYING):
-        logger.warning("worker skipping id=%s group_id=%s unexpected status=%s",
-                       notification_id, notification.get("group_id"), current)
-        return True
-
-    updated = storage.transition(
-        notification_id, PROCESSING, actor="worker",
+    # Acquire the DB row atomically.  A Redis delivery can be duplicated (for
+    # example after a consumer crash); the winner alone is allowed to send.
+    updated = storage.claim_for_processing(
+        notification_id, actor="worker", from_status=notification["status"],
     )
     if updated is None:
+        logger.warning("worker skipping id=%s group_id=%s status was claimed elsewhere",
+                       notification_id, notification.get("group_id"))
         return True
     logger.debug("worker processing notification_id=%s channel=%s status=processing", notification_id, channel)
     record_audit(
@@ -169,7 +166,7 @@ def process_message(channel: str, payload: Dict) -> bool:
         duration_ms = int((time.monotonic() - started) * 1000)
         retryable = is_retryable_error(exc)
         error_code = getattr(exc, "error_code", None)
-        error_msg = str(exc)
+        error_msg = sanitize_provider_error(exc)
 
         storage.add_attempt(
             notification_id, attempt, FAILED,
@@ -226,24 +223,32 @@ def process_message(channel: str, payload: Dict) -> bool:
 
     except Exception as exc:  # noqa: BLE001
         duration_ms = int((time.monotonic() - started) * 1000)
+        error_msg = "Unexpected provider failure."
         storage.add_attempt(
             notification_id, attempt, FAILED,
             provider=provider.name if provider else None,
-            error_code="UNEXPECTED", error_message=str(exc),
+            error_code="UNEXPECTED", error_message=error_msg,
             retryable=True, duration_ms=duration_ms,
         )
+        # An unexpected SDK/runtime failure is retried through the durable
+        # retry stream rather than leaving an acknowledged row in processing.
+        storage.transition(notification_id, RETRYING, actor="worker", error=error_msg)
+        try:
+            delay = backoff_delay_ms(attempt)
+            q.publish_retry(channel, notification_id, notification.get("group_id"),
+                            notification.get("recipient"), attempt + 1,
+                            time.time() + delay / 1000.0)
+        except Exception:  # noqa: BLE001
+            # Leave the stream entry pending so Redis can reclaim it; never
+            # acknowledge a notification whose recovery could not be queued.
+            logger.exception("worker could not persist retry notification_id=%s", notification_id)
+            return False
         logger.exception("worker unexpected error notification_id=%s", notification_id)
-        return True  # ack to avoid poison loop; notification marked failed above
+        return True
 
 
-def _run_once(channel: str, worker_id: str) -> bool:
-    """Consume one batch; returns True if work was found."""
-    try:
-        entries = q.consume(channel, worker_id, count=1)
-    except q.QueueError as exc:
-        logger.error("worker consume failed channel=%s: %s", channel, exc)
-        time.sleep(1)
-        return False
+def _process_entries(channel: str, entries) -> bool:
+    """Process Redis stream entries and ACK only durable outcomes."""
     if not entries:
         return False
     for stream_key, messages in entries:
@@ -264,6 +269,21 @@ def _run_once(channel: str, worker_id: str) -> bool:
             if ack_it:
                 q.ack(channel, entry_id)
     return True
+
+
+def _run_once(channel: str, worker_id: str) -> bool:
+    """Recover abandoned work, then consume one new batch."""
+    try:
+        claimed = q.claim_pending(channel, worker_id)
+        if claimed:
+            logger.info("worker reclaimed pending entries channel=%s count=%d", channel, len(claimed))
+            return _process_entries(channel, [(q.stream_name(channel), claimed)])
+        entries = q.consume(channel, worker_id, count=1)
+    except q.QueueError as exc:
+        logger.error("worker consume failed channel=%s: %s", channel, exc)
+        time.sleep(1)
+        return False
+    return _process_entries(channel, entries)
 
 
 def run_worker(channel: str, worker_id: Optional[str] = None) -> None:

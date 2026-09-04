@@ -229,7 +229,7 @@ def test_webhook_does_not_require_jwt(client, storage, monkeypatch):
         message_id=str(_uuid.uuid4()), channel="whatsapp", recipient="+919887270348",
         message="x", status="submitted",
     )
-    storage.set_provider_info(nid, "vonage_whatsapp", pv)
+    storage.set_provider_info(nid, "azure_whatsapp", pv)
     # No JWT header - the Azure webhook uses Event Grid validation instead.
     r = client.post("/api/v1/whatsapp/webhook",
                     json=[{"data": {"channelType": "whatsapp", "messageId": pv, "status": "delivered"},

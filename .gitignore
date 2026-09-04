@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 .aws/
+.kilo/
 credentials/
 secrets/
 *.key
@@ -15,8 +16,15 @@ venv/
 __pycache__/
 .pytest_cache/
 .coverage
+.coverage.*
+htmlcov/
 *.pyc
 *.db
+*.db.*
+*.sqlite
+*.sqlite.*
 notifications.db
 logs/
+*.log
+*.jsonl
 certs/

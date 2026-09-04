@@ -28,6 +28,17 @@ os.environ["DATABASE_PATH"] = _tmp_db.name
 
 import pytest  # noqa: E402
 
+from tests.asgi_testclient import ASGITestClient, install_test_runtime_compatibility  # noqa: E402
+
+install_test_runtime_compatibility()
+
+# Test modules import this class after conftest is loaded.  Replacing it here
+# confines the sandbox compatibility layer to pytest and preserves production
+# FastAPI/Starlette behavior.
+import fastapi.testclient  # noqa: E402
+
+fastapi.testclient.TestClient = ASGITestClient
+
 
 @pytest.fixture()
 def client(tmp_path):

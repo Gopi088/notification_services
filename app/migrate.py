@@ -50,6 +50,35 @@ _MIGRATION_PG_ADD_DELIVERED_AT = (
     "ALTER TABLE notifications ADD COLUMN IF NOT EXISTS delivered_at TIMESTAMPTZ;"
 )
 
+_MIGRATION_PG_ADD_PRODUCTION_CONSTRAINTS = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_message_id ON notifications (message_id);"
+    "WITH duplicate_provider_ids AS ("
+    "SELECT id, ROW_NUMBER() OVER (PARTITION BY provider_message_id ORDER BY created_at, id) AS row_number "
+    "FROM notifications WHERE provider_message_id IS NOT NULL"
+    ") UPDATE notifications SET provider_message_id = NULL "
+    "WHERE id IN (SELECT id FROM duplicate_provider_ids WHERE row_number > 1);"
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_provider_message_id "
+    "ON notifications (provider_message_id) WHERE provider_message_id IS NOT NULL;"
+    "CREATE INDEX IF NOT EXISTS idx_notifications_recipient_created "
+    "ON notifications (recipient, created_at DESC);"
+)
+
+_MIGRATION_PG_INBOUND_DEDUP = (
+    "DELETE FROM inbound_messages a USING inbound_messages b "
+    "WHERE a.provider_message_id IS NOT NULL "
+    "AND a.provider_message_id = b.provider_message_id AND a.id > b.id;"
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbound_provider_message_id "
+    "ON inbound_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;"
+)
+
+_MIGRATION_SQLITE_INBOUND_DEDUP = (
+    "DELETE FROM inbound_messages WHERE provider_message_id IS NOT NULL "
+    "AND id NOT IN (SELECT MIN(id) FROM inbound_messages "
+    "WHERE provider_message_id IS NOT NULL GROUP BY provider_message_id);"
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_inbound_provider_message_id "
+    "ON inbound_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;"
+)
+
 # Columns that 0002 adds for existing databases (fresh DBs already have them
 # via SQLITE_SCHEMA / PG_SCHEMA CREATE TABLE).
 _ACK_COLUMNS = {
@@ -100,6 +129,12 @@ _MIGRATIONS: List[dict] = [
     {"id": "0005_add_delivered_at_column",
      "pg": _MIGRATION_PG_ADD_DELIVERED_AT,
      "sqlite": None},  # handled specially below (column-aware)
+    {"id": "0006_add_production_notification_constraints",
+     "pg": _MIGRATION_PG_ADD_PRODUCTION_CONSTRAINTS,
+     "sqlite": None},
+    {"id": "0007_add_inbound_provider_message_dedup",
+     "pg": _MIGRATION_PG_INBOUND_DEDUP,
+     "sqlite": _MIGRATION_SQLITE_INBOUND_DEDUP},
 ]
 
 # Same-process lock: serializes concurrent up() calls within one Python process
@@ -207,6 +242,15 @@ def _up_locked() -> int:
                     # no ADD COLUMN IF NOT EXISTS). This also covers the resend
                     # columns, so 0003 has no SQLite script of its own.
                     _repair_sqlite_notification_columns(conn)
+                elif m["id"] == "0007_add_inbound_provider_message_dedup":
+                    # Very old/local databases may predate the optional
+                    # inbound table entirely; there is nothing to deduplicate
+                    # until the normal schema is created on a later upgrade.
+                    exists = conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbound_messages'"
+                    ).fetchone()
+                    if exists:
+                        conn.executescript(m["sqlite"])
                 elif m["sqlite"] is not None:
                     conn.executescript(m["sqlite"])
                 conn.execute(

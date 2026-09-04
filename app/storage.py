@@ -27,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from app.config import get_settings
+from app.providers.base import sanitize_provider_error
 
 logger = logging.getLogger("storage")
 
@@ -170,6 +171,8 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     raw                  TEXT,
     created_at           TEXT NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_inbound_provider_message_id
+    ON inbound_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;
 """
 
 PG_SCHEMA = """
@@ -210,8 +213,23 @@ CREATE TABLE IF NOT EXISTS notifications (
 );
 CREATE INDEX IF NOT EXISTS idx_notifications_status_next ON notifications (status, next_attempt_at);
 CREATE INDEX IF NOT EXISTS idx_notifications_group ON notifications (group_id);
-CREATE INDEX IF NOT EXISTS idx_notifications_provider_id ON notifications (provider_message_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_message_id ON notifications (message_id);
+-- Existing installations can contain legacy duplicate provider IDs.  Retain
+-- the oldest correlation and clear later duplicates before enforcing the
+-- uniqueness invariant required for safe webhook correlation.
+WITH duplicate_provider_ids AS (
+    SELECT id, ROW_NUMBER() OVER (
+        PARTITION BY provider_message_id ORDER BY created_at, id
+    ) AS row_number
+    FROM notifications
+    WHERE provider_message_id IS NOT NULL
+)
+UPDATE notifications SET provider_message_id = NULL
+WHERE id IN (SELECT id FROM duplicate_provider_ids WHERE row_number > 1);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_notifications_provider_message_id
+    ON notifications (provider_message_id) WHERE provider_message_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notifications_idem ON notifications (idempotency_key) WHERE idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_notifications_recipient_created ON notifications (recipient, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS notification_attempts (
     id                   BIGSERIAL PRIMARY KEY,
@@ -289,6 +307,8 @@ CREATE TABLE IF NOT EXISTS inbound_messages (
     raw                  JSONB,
     created_at           TIMESTAMPTZ NOT NULL
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_inbound_provider_message_id
+    ON inbound_messages (provider_message_id) WHERE provider_message_id IS NOT NULL;
 """
 
 
@@ -345,7 +365,7 @@ class Storage:
             try:
                 self._pg_pool = pool.ThreadedConnectionPool(**kwargs)
             except Exception as exc:  # noqa: BLE001
-                logger.error("database connection failed backend=%s: %s", self.backend, exc)
+                logger.error("database connection failed backend=%s: %s", self.backend, sanitize_provider_error(exc))
                 raise
             host = self._safe_host()
             logger.info(
@@ -403,6 +423,7 @@ class Storage:
     def _pg(self):
         import time as _t
 
+        conn = None
         for _ in range(5):
             try:
                 conn = self._pg_pool.getconn()
@@ -412,14 +433,21 @@ class Storage:
                     continue
                 raise
             break
+        if conn is None:
+            raise RuntimeError("PostgreSQL connection pool is exhausted")
+        discard_connection = False
         try:
             yield conn
             conn.commit()
         except Exception:
-            conn.rollback()
+            discard_connection = True
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001 - discard unusable connections below
+                pass
             raise
         finally:
-            self._pg_pool.putconn(conn)
+            self._pg_pool.putconn(conn, close=discard_connection)
 
     # ---- helpers ----
     @staticmethod
@@ -497,7 +525,7 @@ class Storage:
                 )
         else:
             with self._sqlite() as conn:
-                conn.execute(
+                cur = conn.execute(
                     """INSERT INTO notifications
                        (id, message_id, group_id, channel, recipient, message, subject,
                         template_name, template_language, template_params, content_hash, status,
@@ -656,13 +684,14 @@ class Storage:
                        delivered_at = CASE WHEN %s = 'delivered' THEN %s ELSE delivered_at END,
                        acknowledged_at = CASE WHEN %s = 'acknowledged' THEN %s ELSE acknowledged_at END,
                        retry_count = CASE WHEN %s = 'retrying' THEN retry_count + 1 ELSE retry_count END
-                       WHERE id=%s""",
+                       WHERE id=%s AND status=%s""",
                     (to_status, provider, provider_message_id, error, now,
-                     to_status, now, to_status, now, to_status, now, to_status, notification_id),
+                     to_status, now, to_status, now, to_status, now, to_status, notification_id, current),
                 )
+                changed = cur.rowcount == 1
         else:
             with self._sqlite() as conn:
-                conn.execute(
+                cur = conn.execute(
                     """UPDATE notifications SET status=?, provider=COALESCE(?, provider),
                        provider_message_id=COALESCE(?, provider_message_id),
                        last_error=?, updated_at=?,
@@ -670,10 +699,14 @@ class Storage:
                        delivered_at = CASE WHEN ? = 'delivered' THEN ? ELSE delivered_at END,
                        acknowledged_at = CASE WHEN ? = 'acknowledged' THEN ? ELSE acknowledged_at END,
                        retry_count = CASE WHEN ? = 'retrying' THEN retry_count + 1 ELSE retry_count END
-                       WHERE id=?""",
+                       WHERE id=? AND status=?""",
                     (to_status, provider, provider_message_id, error, now,
-                     to_status, now, to_status, now, to_status, now, to_status, notification_id),
+                     to_status, now, to_status, now, to_status, now, to_status, notification_id, current),
                 )
+                changed = cur.rowcount == 1
+        if not changed:
+            logger.info("transition lost race id=%s from=%s to=%s", notification_id, current, to_status)
+            return self.get_notification(notification_id)
         self._insert_event(notification_id, current, to_status, actor, {"error": error})
         group_ref = row.get("group_id") if row else None
         logger.info(
@@ -695,6 +728,41 @@ class Storage:
         except Exception:  # noqa: BLE001 - never let audit failure break a transition
             pass
         return self.get_notification(notification_id)
+
+    def claim_for_processing(self, notification_id: str, *, actor: str = "worker",
+                             from_status: Optional[str] = None) -> Optional[Dict]:
+        """Atomically acquire a queued/retrying notification for one worker.
+
+        The status predicate is the cross-worker lease: only the transaction
+        that changes the row to ``processing`` may call a provider.  Redis
+        stream redelivery therefore cannot create a second provider send.
+        """
+        now = _now()
+        if self.backend == "postgres":
+            safe = self._pg_uuid_safe(notification_id)
+            if safe is None:
+                return None
+            with self._pg() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE notifications SET status=%s, updated_at=%s
+                       WHERE id=%s AND status IN (%s, %s) RETURNING *""",
+                    (PROCESSING, now, safe, QUEUED, RETRYING),
+                )
+                claimed = self._row_to_dict(cur.fetchone(), cur)
+        else:
+            with self._sqlite() as conn:
+                cur = conn.execute(
+                    """UPDATE notifications SET status=?, updated_at=?
+                       WHERE id=? AND status IN (?, ?)""",
+                    (PROCESSING, now, notification_id, QUEUED, RETRYING),
+                )
+                if cur.rowcount != 1:
+                    return None
+                claimed_row = conn.execute("SELECT * FROM notifications WHERE id=?", (notification_id,)).fetchone()
+                claimed = self._row_to_dict(claimed_row)
+        if claimed is not None:
+            self._insert_event(notification_id, from_status, PROCESSING, actor, None)
+        return claimed
 
     def mark_read(self, notification_id: str, *, actor: str = "webhook") -> Optional[Dict]:
         """Transition submitted/delivered → read. Returns the updated row."""
@@ -1075,20 +1143,31 @@ class Storage:
                 cur.execute(
                     """INSERT INTO inbound_messages
                        (channel, from_number, to_number, text, provider_message_id, raw, created_at)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (provider_message_id) WHERE provider_message_id IS NOT NULL
+                       DO NOTHING RETURNING id""",
                     (channel, from_number, to_number, text, provider_message_id, raw_json, now),
                 )
                 row = cur.fetchone()
-                return row[0]
+                if row:
+                    return row[0]
+                cur.execute("SELECT id FROM inbound_messages WHERE provider_message_id=%s", (provider_message_id,))
+                return cur.fetchone()[0]
         else:
             with self._sqlite() as conn:
-                cur = conn.execute(
-                    """INSERT INTO inbound_messages
-                       (channel, from_number, to_number, text, provider_message_id, raw, created_at)
-                       VALUES (?,?,?,?,?,?,?)""",
-                    (channel, from_number, to_number, text, provider_message_id, raw_json, now),
-                )
-                return cur.lastrowid
+                try:
+                    cur = conn.execute(
+                        """INSERT INTO inbound_messages
+                           (channel, from_number, to_number, text, provider_message_id, raw, created_at)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        (channel, from_number, to_number, text, provider_message_id, raw_json, now),
+                    )
+                    return cur.lastrowid
+                except sqlite3.IntegrityError:
+                    row = conn.execute(
+                        "SELECT id FROM inbound_messages WHERE provider_message_id=?", (provider_message_id,),
+                    ).fetchone()
+                    return row[0]
 
     def list_inbound(self, limit: int = 50) -> List[Dict]:
         """Return the most recent inbound messages."""

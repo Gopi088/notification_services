@@ -27,7 +27,7 @@ from app.templates import TemplateError, render_email
 logger = logging.getLogger("azure_provider")
 
 _DIGITS_RE = re.compile(r"[^\d]")
-MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20 MB per downloaded attachment
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # backward-compatible hard ceiling
 
 
 def _normalize_phone(contact: str, country_code: str) -> str:
@@ -191,6 +191,12 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
             content_type = att.get("type") or att.get("contentType") or "application/octet-stream"
             if att.get("content_base64"):
                 encoded = att["content_base64"]
+                # Estimate decoded bytes without materialising a second copy.
+                decoded_size = (len(encoded.rstrip("=")) * 3) // 4
+                if decoded_size > get_settings().MAX_FILE_SIZE_BYTES:
+                    raise ProviderError(
+                        f"Attachment '{name}' exceeds {get_settings().MAX_FILE_SIZE_BYTES} bytes."
+                    )
             elif att.get("url"):
                 encoded = AzureEmailProvider._fetch_as_base64(att["url"])
             else:
@@ -237,6 +243,7 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
     @staticmethod
     def _fetch_as_base64(url: str) -> str:
         AzureEmailProvider._validate_url(url)
+        max_bytes = min(MAX_ATTACHMENT_BYTES, get_settings().MAX_FILE_SIZE_BYTES)
         reason: Optional[str] = None
         chunks: list = []
         try:
@@ -248,16 +255,16 @@ class AzureEmailProvider(_AzureMixin, NotificationProvider):
                     content_length = resp.headers.get("content-length")
                     if content_length:
                         try:
-                            if int(content_length) > MAX_ATTACHMENT_BYTES:
-                                reason = f"Attachment from {url} exceeds {MAX_ATTACHMENT_BYTES} bytes."
+                            if int(content_length) > max_bytes:
+                                reason = f"Attachment from {url} exceeds {max_bytes} bytes."
                         except ValueError:
                             pass
                     if reason is None:
                         total = 0
                         for chunk in resp.iter_bytes(64 * 1024):
                             total += len(chunk)
-                            if total > MAX_ATTACHMENT_BYTES:
-                                reason = f"Attachment from {url} exceeds {MAX_ATTACHMENT_BYTES} bytes."
+                            if total > max_bytes:
+                                reason = f"Attachment from {url} exceeds {max_bytes} bytes."
                                 break
                             chunks.append(chunk)
         except Exception as exc:  # noqa: BLE001

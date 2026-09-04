@@ -114,23 +114,30 @@ def test_main_unhandled_returns_500(client):
 
 def test_main_readiness_queue_fail(monkeypatch):
     import os
+    from types import SimpleNamespace
     from fastapi.testclient import TestClient
 
     os.environ["QUEUE_ENABLED"] = "true"
-    os.environ["MOCK_MODE"] = "false"
+    os.environ["MOCK_MODE"] = "true"
     from app.config import get_settings
 
     get_settings.cache_clear()
     from app import queue as q
 
-    def boom():
+    def boom(*args, **kwargs):
         raise RuntimeError("redis down")
 
     monkeypatch.setattr(q, "_client", boom)
     monkeypatch.setattr(q, "queue_length", boom)
-    from app.main import app
+    import app.main as main
 
-    with TestClient(app) as c:
+    with TestClient(main.app) as c:
+        # Startup remains in isolated mock mode.  Exercise the production
+        # readiness decision itself, where a configured queue outage is 503.
+        monkeypatch.setattr(
+            main, "get_settings",
+            lambda: SimpleNamespace(QUEUE_ENABLED=True, MOCK_MODE=False),
+        )
         r = c.get("/api/v1/health/readiness")
     assert r.status_code == 503
     os.environ["QUEUE_ENABLED"] = "false"

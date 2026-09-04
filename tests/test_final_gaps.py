@@ -127,7 +127,11 @@ def test_storage_pg_full_crud(monkeypatch):
     assert n["status"] == "queued"
     # transition to processing then submitted (valid path)
     s.transition(nid, "processing", actor="t")
-    s.transition(nid, "submitted", actor="t", provider="p", provider_message_id="pm")
+    # The PostgreSQL integration database is persistent across local runs;
+    # provider IDs are globally unique in production, so the fixture must be
+    # unique as well.
+    s.transition(nid, "submitted", actor="t", provider="p",
+                 provider_message_id=f"pm-{uuid.uuid4()}")
     assert s.get_notification(nid)["status"] == "submitted"
     # attempts + events
     s.add_attempt(nid, 1, "submitted", provider="p", provider_message_id="pm", duration_ms=5)

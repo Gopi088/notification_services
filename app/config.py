@@ -24,8 +24,6 @@ class Settings(BaseSettings):
     # "sent" locally and marked delivered/failed pseudo-randomly. This lets
     # you exercise the full API from the CLI without any real credentials.
     MOCK_MODE: bool = True
-    DATABASE_PATH: str = "notifications.db"
-
     # --- Authentication ---
     # Set AUTH_ENABLED=true to require an API key on notification API routes.
     AUTH_ENABLED: bool = False
@@ -175,12 +173,16 @@ class Settings(BaseSettings):
     # ID like "Vonage APIs"). Must be a number you own / a sender registered
     # with Vonage.
     VONAGE_SMS_FROM: str = ""
+    # Provider selection is explicit in production.  ``auto`` is retained
+    # only for backwards-compatible local development configurations.
+    SMS_PROVIDER: str = "azure"  # azure, vonage, twilio, or auto (local only)
 
     # --- Vonage WhatsApp Sandbox ---
     # When VONAGE_WHATSAPP_FROM is set, the WhatsApp channel uses the Vonage
     # Messages Sandbox instead of Azure. Credentials are shared with Vonage SMS.
     VONAGE_WHATSAPP_FROM: str = ""
     VONAGE_WHATSAPP_SANDBOX_URL: str = "https://messages-sandbox.nexmo.com/v1/messages"
+    WHATSAPP_PROVIDER: str = "azure"  # azure, vonage, twilio, or auto (local only)
 
     # --- Twilio (optional SMS + WhatsApp provider) ---
     # When TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are set, the SMS and
@@ -231,6 +233,10 @@ class Settings(BaseSettings):
     #   https://<host>/api/v1/twilio/whatsapp/status
     TWILIO_SMS_STATUS_CALLBACK_URL: str = ""
     TWILIO_WHATSAPP_STATUS_CALLBACK_URL: str = ""
+
+    # Shared secret for Azure/Event Grid delivery webhooks.  It is required
+    # outside MOCK_MODE and must be sent as X-Webhook-Secret.
+    WEBHOOK_SHARED_SECRET: str = ""
 
     # --- Delivery polling / reconciliation (fallback to webhooks) ---
     # When true, on-demand status polling (e.g. GET status -> query provider)
